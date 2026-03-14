@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""
+Experiment: Foundation Basic
+Phase 1: Foundational "All-Token" E2E Implementation
+
+Features:
+- Unified sequence paradigm (y={c,b,t,<Sep>})
+- Right-shifted tokens for synchronized training
+- Unified Cross-Entropy loss treating all tokens equally
+"""
+import argparse
+import sys
+from pathlib import Path
+
+# Add project root to path
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
+
+from torch.utils.data import DataLoader
+from pathlib import Path
+from experiments.base_experiment import ExperimentConfig, run_experiment
+from tsr.data.dataset import TableDataset, collate_fn
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Foundation Basic Experiment")
+    parser.add_argument(
+        "--data_path",
+        type=str,
+        required=True,
+        help="Path to training data (JSON file or directory)"
+    )
+    parser.add_argument(
+        "--val_path",
+        type=str,
+        default=None,
+        help="Path to validation data (optional)"
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="./experiment_results",
+        help="Output directory for results"
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda",
+        help="Device to use (cuda or cpu)"
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=4,
+        help="Batch size for training"
+    )
+    parser.add_argument(
+        "--num_epochs",
+        type=int,
+        default=10,
+        help="Number of training epochs"
+    )
+    parser.add_argument(
+        "--learning_rate",
+        type=float,
+        default=1e-4,
+        help="Learning rate"
+    )
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Path to checkpoint to resume from (e.g., 'latest.pth', 'best.pth', 'epoch_5.pth', or full path)"
+    )
+    
+    args = parser.parse_args()
+    
+    # Create data loaders
+    print("Loading datasets...")
+    
+    # Check if using simplified format (dataset_list.json)
+    use_simplified = Path(args.data_path).name == "dataset_list.json" or "dataset_list" in args.data_path
+    
+    # Use smaller image size for memory efficiency
+    image_size = (384, 512)  # Reduced from (512, 640)
+    
+    train_dataset = TableDataset(
+        data_path=args.data_path,
+        image_size=image_size,
+        augment=False,
+        use_simplified_format=use_simplified,
+    )
+    
+    val_dataset = None
+    if args.val_path:
+        val_dataset = TableDataset(
+            data_path=args.val_path,
+            vocab=train_dataset.vocab,
+            image_size=image_size,
+            augment=False,
+            use_simplified_format=use_simplified,
+        )
+    
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=0,  # Set to 0 to avoid multiprocessing issues
+        pin_memory=True if args.device == "cuda" else False,
+        collate_fn=collate_fn,
+    )
+    
+    val_loader = None
+    if val_dataset:
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=0,  # Set to 0 to avoid multiprocessing issues
+            pin_memory=True if args.device == "cuda" else False,
+            collate_fn=collate_fn,
+        )
+    
+    print(f"Training samples: {len(train_dataset)}")
+    if val_dataset:
+        print(f"Validation samples: {len(val_dataset)}")
+    print(f"Vocabulary size: {len(train_dataset.vocab)}")
+    
+    # Create experiment config (optimized for extreme memory savings)
+    config = ExperimentConfig(
+        name="Foundation_Basic",
+        phase="foundation",
+        encoder_backbone="convstem",  # Smallest encoder for memory savings
+        embed_dim=384,  # Further reduced for extreme memory savings
+        decoder_layers=3,  # Further reduced for extreme memory savings
+        decoder_heads=6,  # Reduced for memory savings
+        ffn_dim=1536,  # Further reduced for extreme memory savings
+        dropout=0.1,
+        use_unified_ce_loss=True,
+        use_hybrid_regression=False,
+        use_html_refiner=False,
+        use_gc_attention=False,
+        use_parallel_decoder=False,
+        token_compression=0.8,  # Enable token compression (20% reduction)
+        batch_size=args.batch_size if args.batch_size else 1,  # Minimum batch size
+        num_epochs=args.num_epochs,
+        learning_rate=args.learning_rate,
+        gradient_accumulation_steps=8,  # Effective batch size = 1 * 8 = 8
+        use_mixed_precision=True,  # FP16 for memory efficiency
+        gradient_checkpointing=True,  # Enabled by default for extreme memory savings
+        image_size=image_size,
+    )
+    
+    # Run experiment (pass vocabulary for checkpoint saving)
+    run_experiment(
+        config=config,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        device=args.device,
+        output_dir=args.output_dir,
+        vocab=train_dataset.vocab,
+        resume_from=args.resume,
+    )
+
+
+if __name__ == "__main__":
+    main()
+

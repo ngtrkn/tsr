@@ -1,0 +1,42 @@
+# Configuration for Table Recognition Model
+
+# Model configuration
+model:
+  encoder_backbone: "swin_b"  # Options: "swin_b", "resnet31", "convstem"
+  embed_dim: 768
+  decoder_layers: 6
+  decoder_heads: 8
+  ffn_dim: 3072
+  dropout: 0.1
+  use_html_refiner: true
+  use_gc_attention: true
+  token_compression: null  # Set to 0.8 for 20% reduction
+  use_hybrid_regression: true
+  use_parallel_decoder: false  # Set to true for DREAM parallel decoding
+
+# Data configuration
+data:
+  train_path: "data/train"  # Path to training data (JSON file or directory)
+  val_path: "data/val"  # Path to validation data (optional)
+  image_size: [512, 640]  # [height, width]
+  augment: false
+
+# Training configuration
+training:
+  batch_size: 8
+  num_epochs: 100
+  learning_rate: 1e-4
+  weight_decay: 0.01
+  num_workers: 4
+  log_interval: 100
+  save_dir: "./checkpoints"
+
+# Loss configuration
+loss:
+  lambda_struc: 1.0  # Structure token CE loss weight
+  lambda_cont: 1.0   # Content token CE loss weight
+  lambda_l1: 1.0     # L1 regression loss weight
+  lambda_iou: 1.0    # IoU loss weight
+  lambda_consistency: 0.1  # Column consistency loss weight
+
+
