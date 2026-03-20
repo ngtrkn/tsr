@@ -82,7 +82,8 @@ def main():
     use_simplified = Path(args.data_path).name == "dataset_list.json" or "dataset_list" in args.data_path
     
     # Use smaller image size for memory efficiency
-    image_size = (384, 512)  # Reduced from (512, 640)
+    image_size = (512, 640)
+    # image_size = (384, 512)  # Reduced from (512, 640)
     
     train_dataset = TableDataset(
         data_path=args.data_path,
@@ -105,8 +106,8 @@ def main():
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=0,  # Set to 0 to avoid multiprocessing issues
-        pin_memory=True if args.device == "cuda" else False,
+        # num_workers=0,  # Set to 0 to avoid multiprocessing issues
+        pin_memory=False, #True if args.device == "cuda" else False,
         collate_fn=collate_fn,
     )
     
@@ -116,8 +117,8 @@ def main():
             val_dataset,
             batch_size=args.batch_size,
             shuffle=False,
-            num_workers=0,  # Set to 0 to avoid multiprocessing issues
-            pin_memory=True if args.device == "cuda" else False,
+            # num_workers=0,  # Set to 0 to avoid multiprocessing issues
+            pin_memory= False, #True if args.device == "cuda" else False,
             collate_fn=collate_fn,
         )
     
@@ -130,7 +131,7 @@ def main():
     config = ExperimentConfig(
         name="Foundation_Basic",
         phase="foundation",
-        encoder_backbone="convstem",  # Smallest encoder for memory savings
+        encoder_backbone="resnet31",  # Smallest encoder for memory savings
         embed_dim=384,  # Further reduced for extreme memory savings
         decoder_layers=3,  # Further reduced for extreme memory savings
         decoder_heads=6,  # Reduced for memory savings
@@ -145,7 +146,7 @@ def main():
         batch_size=args.batch_size if args.batch_size else 1,  # Minimum batch size
         num_epochs=args.num_epochs,
         learning_rate=args.learning_rate,
-        gradient_accumulation_steps=8,  # Effective batch size = 1 * 8 = 8
+        gradient_accumulation_steps=8 // args.batch_size,  # Effective batch size = 1 * 8 = 8
         use_mixed_precision=True,  # FP16 for memory efficiency
         gradient_checkpointing=True,  # Enabled by default for extreme memory savings
         image_size=image_size,
