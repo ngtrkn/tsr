@@ -16,7 +16,7 @@ from tsr.losses.losses import MultiTaskLoss
 from tsr.data.dataset import TableDataset
 from tsr.data.serialization import SequenceSerializer, EOS_TOKEN
 from tsr.metrics.tsr_metrics import calculate_table_metrics, tokens_to_html
-
+from tqdm import tqdm
 
 @dataclass
 class ExperimentConfig:
@@ -116,13 +116,38 @@ def train_epoch(model, train_loader, optimizer, criterion, device, config, scale
     
     optimizer.zero_grad()
     
+    pbar = tqdm(total=len(train_loader))
     for batch_idx, batch in enumerate(train_loader):
         images = batch["image"].to(device)
         input_ids = batch["input_ids"].to(device)
-        
-        # Mixed precision forward pass
-        if config.use_mixed_precision and scaler is not None:
-            with torch.cuda.amp.autocast():
+        try:
+            # Mixed precision forward pass
+            if config.use_mixed_precision and scaler is not None:
+                with torch.cuda.amp.autocast():
+                    if isinstance(criterion, MultiTaskLoss):
+                        outputs = model(images, input_ids=input_ids, return_regression=config.use_hybrid_regression)
+                        targets = {
+                            "token_ids": batch["token_ids"].to(device),
+                            "structure_mask": batch["structure_mask"].to(device),
+                            "content_mask": batch["content_mask"].to(device),
+                        }
+                        if "bboxes" in batch and config.use_hybrid_regression:
+                            targets["bboxes"] = batch["bboxes"].to(device)
+                            targets["bbox_mask"] = batch["bbox_mask"].to(device)
+                        
+                        loss_dict = criterion(outputs, targets)
+                        loss = loss_dict["total_loss"]
+                    else:
+                        outputs = model(images, input_ids=input_ids)
+                        loss = criterion(
+                            outputs["logits"].view(-1, outputs["logits"].size(-1)),
+                            batch["token_ids"].view(-1).to(device)
+                        )
+                    
+                    # Scale loss for gradient accumulation
+                    loss = loss / accumulation_steps
+            else:
+                # Standard precision
                 if isinstance(criterion, MultiTaskLoss):
                     outputs = model(images, input_ids=input_ids, return_regression=config.use_hybrid_regression)
                     targets = {
@@ -135,64 +160,49 @@ def train_epoch(model, train_loader, optimizer, criterion, device, config, scale
                         targets["bbox_mask"] = batch["bbox_mask"].to(device)
                     
                     loss_dict = criterion(outputs, targets)
-                    loss = loss_dict["total_loss"]
+                    loss = loss_dict["total_loss"] / accumulation_steps
                 else:
                     outputs = model(images, input_ids=input_ids)
                     loss = criterion(
                         outputs["logits"].view(-1, outputs["logits"].size(-1)),
                         batch["token_ids"].view(-1).to(device)
-                    )
-                
-                # Scale loss for gradient accumulation
-                loss = loss / accumulation_steps
-        else:
-            # Standard precision
-            if isinstance(criterion, MultiTaskLoss):
-                outputs = model(images, input_ids=input_ids, return_regression=config.use_hybrid_regression)
-                targets = {
-                    "token_ids": batch["token_ids"].to(device),
-                    "structure_mask": batch["structure_mask"].to(device),
-                    "content_mask": batch["content_mask"].to(device),
-                }
-                if "bboxes" in batch and config.use_hybrid_regression:
-                    targets["bboxes"] = batch["bboxes"].to(device)
-                    targets["bbox_mask"] = batch["bbox_mask"].to(device)
-                
-                loss_dict = criterion(outputs, targets)
-                loss = loss_dict["total_loss"] / accumulation_steps
-            else:
-                outputs = model(images, input_ids=input_ids)
-                loss = criterion(
-                    outputs["logits"].view(-1, outputs["logits"].size(-1)),
-                    batch["token_ids"].view(-1).to(device)
-                ) / accumulation_steps
+                    ) / accumulation_steps
         
-        # Backward pass
-        if config.use_mixed_precision and scaler is not None:
-            scaler.scale(loss).backward()
-        else:
-            loss.backward()
-        
-        # Update weights every accumulation_steps
-        if (batch_idx + 1) % accumulation_steps == 0:
+            # Backward pass
             if config.use_mixed_precision and scaler is not None:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
+                scaler.scale(loss).backward()
             else:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
+                loss.backward()
             
-            # Learning rate warmup (update after optimizer step)
-            if warmup_scheduler is not None:
-                warmup_scheduler.step()
-            
+            # Update weights every accumulation_steps
+            if (batch_idx + 1) % accumulation_steps == 0:
+                if config.use_mixed_precision and scaler is not None:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+                
+                # Learning rate warmup (update after optimizer step)
+                if warmup_scheduler is not None:
+                    warmup_scheduler.step()
+                
+                optimizer.zero_grad()
+                current_step += 1
+        except:
             optimizer.zero_grad()
             current_step += 1
+            continue
         
         total_loss += loss.item() * accumulation_steps  # Scale back for logging
         num_batches += 1
+
+        # Update the progress bar manually by the desired increment
+        pbar.update(1) 
+        # Add a dynamic description to the bar
+        pbar.set_description(f"{loss.item()}")
     
     # Handle remaining gradients if batch doesn't divide evenly
     if num_batches % accumulation_steps != 0:
