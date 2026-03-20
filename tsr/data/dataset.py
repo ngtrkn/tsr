@@ -1,6 +1,8 @@
 """
 Dataset classes for table recognition
 """
+from multiprocessing import Pool
+
 import torch
 from torch.utils.data import Dataset
 from PIL import Image
@@ -9,6 +11,8 @@ from typing import List, Dict, Tuple, Optional
 from pathlib import Path
 import numpy as np
 from .serialization import SequenceSerializer, TableData, CellData
+from tqdm import tqdm
+import os
 
 
 def collate_fn(batch: List[Dict]) -> Dict:
@@ -156,11 +160,12 @@ class TableDataset(Dataset):
             # Load all labels to build vocabulary
             self.data = []
             for image_path, label_path in self.data_pairs:
-                with open(label_path, 'r') as f:
-                    label_data = json.load(f)
-                    # Add image_path to label data for compatibility
-                    label_data['image_path'] = image_path
-                    self.data.append(label_data)
+                # with open(label_path, 'r') as f:
+                #     label_data = json.load(f)
+                #     # Add image_path to label data for compatibility
+                #     label_data['image_path'] = image_path
+                #     self.data.append(label_data) 
+                self.data.append(dict(image_path=image_path, label_path=label_path))
         else:
             # Format 1: Legacy format (JSON file or directory)
             if self.data_path.is_file():
@@ -185,20 +190,39 @@ class TableDataset(Dataset):
         # Build vocabulary
         if vocab is None:
             # Create vocabulary from all sequences
-            sequences = []
-            for item in self.data:
-                table = self._load_table(item)
-                seq = self.serializer.serialize_table(table)
-                sequences.append(seq)
+            with Pool(processes=4) as pool:
+                sequences = pool.map(self._load_single_sequence, self.data)
+
+            # sequences = []
+            
+            # pbar = tqdm(total=len(self.data))
+            # for item in self.data:
+            #     table = self._load_table(item)
+            #     seq = self.serializer.serialize_table(table)
+            #     sequences.append(seq)
+            #     # Update the progress bar manually by the desired increment
+            #     pbar.update(1) 
+            #     # Add a dynamic description to the bar
+            #     pbar.set_description(f"{os.path.basename(item['image_path'])}")
             self.vocab = self.serializer.create_vocabulary(sequences)
         else:
             self.vocab = vocab
         
         self.id_to_token = {v: k for k, v in self.vocab.items()}
+
+    def _load_single_sequence(self, item: Dict) -> List[str]:
+        table = self._load_table(item)
+        return self.serializer.serialize_table(table)
     
     def _load_table(self, item: Dict) -> TableData:
         """Load table data from item"""
-        table_info = item["table"]
+        if "label_path" in item:
+            with open(item['label_path'], 'r') as f:
+                _item = json.load(f)
+            table_info = _item["table"]
+
+        else:
+            table_info = item["table"]
         cells = []
         
         for cell_info in table_info["cells"]:

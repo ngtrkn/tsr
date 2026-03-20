@@ -10,6 +10,7 @@ import json
 import random
 import shutil
 from typing import List, Tuple
+from multiprocessing import Pool, cpu_count
 
 # Add project root to path
 project_root = Path(__file__).parent
@@ -51,12 +52,13 @@ def convert_and_save_label(
     words_path: str,
     output_path: str,
     image_base_dir: str = None
-) -> bool:
+) -> Tuple[bool, str, str]:
     """
     Convert Pub1M label to model format and save
     
     Returns:
-        True if successful, False otherwise
+        Tuple of (success: bool, image_path: str, label_path: str)
+        If failed, returns (False, None, output_path)
     """
     try:
         parser = Pub1MParser(
@@ -65,26 +67,7 @@ def convert_and_save_label(
             image_path=None
         )
         
-        data = parser.parse_to_model_format()
-        
-        # Update image path if image_base_dir provided
-        if image_base_dir:
-            # Try to find image in athena_format directory
-            image_filename = Path(data['image_path']).name
-            athena_base = Path("/mnt/disks/data/flax/table_data/external/pub1m/org/athena_format/train")
-            
-            # Search for image
-            image_path = None
-            if athena_base.exists():
-                for subdir in athena_base.iterdir():
-                    if subdir.is_dir():
-                        candidate = subdir / "input" / image_filename
-                        if candidate.exists():
-                            image_path = str(candidate)
-                            break
-            
-            if image_path:
-                data['image_path'] = image_path
+        data = parser.parse_to_model_format(image_base = image_base_dir)
         
         # Save converted label
         output_path = Path(output_path)
@@ -93,11 +76,20 @@ def convert_and_save_label(
         with open(output_path, 'w') as f:
             json.dump(data, f, indent=2)
         
-        return True
+        return (True, data['image_path'], str(output_path))
     
     except Exception as e:
         print(f"Error converting {xml_path}: {e}")
-        return False
+        return (False, None, str(output_path))
+
+
+def _process_single_label(args_tuple):
+    """
+    Worker function for multiprocessing
+    Unpacks arguments and calls convert_and_save_label
+    """
+    xml_path, words_path, output_path, image_base_dir = args_tuple
+    return convert_and_save_label(xml_path, words_path, output_path, image_base_dir)
 
 
 def create_dataset_split(
@@ -107,13 +99,17 @@ def create_dataset_split(
     split_name: str,
     num_samples: int,
     seed: int = 42,
-    used_samples: set = None
+    used_samples: set = None,
+    num_workers: int = None,
+    image_base_dir: str = None
 ) -> Tuple[List[Tuple[str, str]], set]:
     """
     Create a dataset split (train/val/test)
     
     Args:
         used_samples: Set of already used sample identifiers to avoid overlap
+        num_workers: Number of worker processes (default: cpu_count())
+        image_base_dir: Base directory for images (optional)
     
     Returns:
         Tuple of (list of (image_path, label_path) tuples, updated used_samples set)
@@ -122,6 +118,9 @@ def create_dataset_split(
     
     if used_samples is None:
         used_samples = set()
+    
+    if num_workers is None:
+        num_workers = cpu_count()
     
     # Find available samples
     available_pairs = find_available_samples(xml_dir, words_dir, max_samples=None)
@@ -150,26 +149,28 @@ def create_dataset_split(
     labels_dir = output_dir / split_name / "labels"
     labels_dir.mkdir(parents=True, exist_ok=True)
     
-    dataset_list = []
-    
-    for i, (xml_path, words_path) in enumerate(sampled_pairs):
+    # Prepare arguments for parallel processing
+    process_args = []
+    sample_ids = []
+    for xml_path, words_path in sampled_pairs:
         xml_file = Path(xml_path)
         sample_id = xml_file.stem
-        
-        # Convert label
         label_path = labels_dir / f"{sample_id}.json"
-        
-        if convert_and_save_label(xml_path, words_path, str(label_path)):
-            # Get image path from converted label
-            with open(label_path, 'r') as f:
-                label_data = json.load(f)
-                image_path = label_data['image_path']
-            
-            dataset_list.append((image_path, str(label_path)))
-            used_samples.add(sample_id)  # Mark as used
-            
-            if (i + 1) % 50 == 0:
-                print(f"  Processed {i + 1}/{num_samples} samples...")
+        process_args.append((xml_path, words_path, str(label_path), image_base_dir))
+        sample_ids.append(sample_id)
+    
+    # Process labels in parallel
+    print(f"  Processing {num_samples} samples using {num_workers} workers...")
+    dataset_list = []
+    
+    with Pool(processes=num_workers) as pool:
+        results = pool.map(_process_single_label, process_args)
+    
+    # Collect successful results
+    for i, (success, image_path, label_path) in enumerate(results):
+        if success:
+            dataset_list.append((image_path, label_path))
+            used_samples.add(sample_ids[i])  # Mark as used
     
     print(f"  Completed: {len(dataset_list)}/{num_samples} samples")
     
@@ -231,6 +232,18 @@ def main():
         default=42,
         help="Random seed for reproducibility"
     )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=None,
+        help="Number of worker processes for parallel processing (default: number of CPU cores)"
+    )
+    parser.add_argument(
+        "--image_base_dir",
+        type=str,
+        default=None,
+        help="Base directory for images (optional)"
+    )
     
     args = parser.parse_args()
     
@@ -248,62 +261,77 @@ def main():
     # Create splits (ensure no overlap)
     used_samples = set()
     
-    train_list, used_samples = create_dataset_split(
-        args.xml_dir,
-        args.words_dir,
-        args.output_dir,
-        "train",
-        args.num_train,
-        seed=args.seed,
-        used_samples=used_samples
-    )
+    num_workers = args.num_workers if args.num_workers else cpu_count() // 2
+    print(f"Using {num_workers} worker processes for parallel processing")
     
-    val_list, used_samples = create_dataset_split(
-        args.xml_dir,
-        args.words_dir,
-        args.output_dir,
-        "val",
-        args.num_val,
-        seed=args.seed,
-        used_samples=used_samples
-    )
+    if args.num_train > 0:
+        train_list, used_samples = create_dataset_split(
+            args.xml_dir,
+            args.words_dir,
+            args.output_dir,
+            "train",
+            args.num_train,
+            seed=args.seed,
+            used_samples=used_samples,
+            num_workers=num_workers,
+            image_base_dir=args.image_base_dir
+        )
+        save_dataset_list(train_list, output_dir / "train" / "dataset_list.json")
+
+    if args.num_val > 0:
+        val_list, used_samples = create_dataset_split(
+            args.xml_dir,
+            args.words_dir,
+            args.output_dir,
+            "val",
+            args.num_val,
+            seed=args.seed,
+            used_samples=used_samples,
+            num_workers=num_workers,
+            image_base_dir=args.image_base_dir
+        )
+        save_dataset_list(val_list, output_dir / "val" / "dataset_list.json")
     
-    test_list, used_samples = create_dataset_split(
-        args.xml_dir,
-        args.words_dir,
-        args.output_dir,
-        "test",
-        args.num_test,
-        seed=args.seed,
-        used_samples=used_samples
-    )
+    if args.num_test > 0:
+        test_list, used_samples = create_dataset_split(
+            args.xml_dir,
+            args.words_dir,
+            args.output_dir,
+            "test",
+            args.num_test,
+            seed=args.seed,
+            used_samples=used_samples,
+            num_workers=num_workers,
+            image_base_dir=args.image_base_dir
+        )
+        save_dataset_list(test_list, output_dir / "test" / "dataset_list.json")
     
     # Save dataset lists
-    save_dataset_list(train_list, output_dir / "train" / "dataset_list.json")
-    save_dataset_list(val_list, output_dir / "val" / "dataset_list.json")
-    save_dataset_list(test_list, output_dir / "test" / "dataset_list.json")
     
-    # Create summary
-    summary = {
-        "train": len(train_list),
-        "val": len(val_list),
-        "test": len(test_list),
-        "total": len(train_list) + len(val_list) + len(test_list)
-    }
     
-    summary_path = output_dir / "dataset_summary.json"
-    with open(summary_path, 'w') as f:
-        json.dump(summary, f, indent=2)
     
-    print("\n" + "="*60)
-    print("Dataset Creation Complete!")
-    print("="*60)
-    print(f"Train: {summary['train']} samples")
-    print(f"Val: {summary['val']} samples")
-    print(f"Test: {summary['test']} samples")
-    print(f"Total: {summary['total']} samples")
-    print(f"\nDataset saved to: {args.output_dir}")
-    print(f"Summary: {summary_path}")
+    
+    # # Create summary
+    # summary = {
+    #     "train": len(train_list),
+    #     "val": len(val_list),
+    #     "test": len(test_list),
+    #     "total": len(train_list) + len(val_list) + len(test_list)
+    # }
+    
+    # summary_path = output_dir / "dataset_summary.json"
+    # with open(summary_path, 'w') as f:
+    #     json.dump(summary, f, indent=2)
+    
+    # print("\n" + "="*60)
+    # print("Dataset Creation Complete!")
+    # print("="*60)
+    # print(f"Train: {summary['train']} samples")
+    # print(f"Val: {summary['val']} samples")
+    # print(f"Test: {summary['test']} samples")
+    # print(f"Total: {summary['total']} samples")
+    # print(f"\nDataset saved to: {args.output_dir}")
+    # print(f"Summary: {summary_path}")
 
 
 if __name__ == "__main__":

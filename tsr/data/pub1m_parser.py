@@ -409,7 +409,7 @@ class Pub1MParser:
         
         return cells
     
-    def parse_to_model_format(self) -> Dict:
+    def parse_to_model_format(self, image_base: Path = None) -> Dict:
         """
         Parse XML and words to model-expected format with spanning cell support
         
@@ -439,29 +439,16 @@ class Pub1MParser:
             image_path = str(self.image_path)
         elif self.filename:
             # Try multiple locations for image
-            athena_base = Path("/mnt/disks/data/flax/table_data/external/pub1m/org/athena_format/")
-            possible_paths = []
-            for category in ["train", "test", "val"]:
-                for number in range(400):
-                    possible_paths.append(athena_base / category / f"{category}{number}" / "input" / f"{self.filename}")
-            
-            # possible_paths = [
-            #     # Try athena_format directory directly
-            #     athena_base / self.filename,
-            #     # Try same directory as XML
-            #     self.xml_path.parent / self.filename,
-            #     # Try parent directories
-            #     self.xml_path.parent.parent / "athena_format" / "test" / self.filename,
-            # ]
-            
-            # # Also search in subdirectories of athena_format/test
-            # if athena_base.exists():
-            #     for subdir in athena_base.iterdir():
-            #         if subdir.is_dir():
-            #             # Try in input subdirectory
-            #             possible_paths.append(subdir / "input" / self.filename)
-            #             # Try directly in subdirectory
-            #             possible_paths.append(subdir / self.filename)
+            image_base = Path("/mnt/hdd2/data/pub1m/images/images") if image_base is not None else image_base
+            possible_paths = [
+                image_base / f"{self.filename}"
+            ]   # origin pub1m label
+            if Path(image_base / "train").exists():     # Cinnamon convert
+                for category in ["train", "test", "val"]:
+                    for number in range(400):
+                        possible_paths.append(image_base / category / f"{category}{number}" / "input" / f"{self.filename}")
+
+
             
             image_path = None
             for path in possible_paths:
