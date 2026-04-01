@@ -117,6 +117,8 @@ class SequenceSerializer:
                     sequence.append(ROW_END)
                 sequence.append(ROW_START)
                 current_row = []
+            elif prev_y is None:
+                sequence.append(ROW_START)
             
             current_row.append(cell)
             prev_y = ymin

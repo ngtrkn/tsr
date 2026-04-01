@@ -10,87 +10,116 @@ from xml.dom import minidom
 
 def tokens_to_html(tokens: List[str], vocab: Optional[Dict[str, int]] = None) -> str:
     """
-    Convert token sequence to HTML table structure
-    
-    Args:
-        tokens: List of tokens (e.g., ['<table>', '<tr>', '<td>', ...])
-        vocab: Optional vocabulary dict (not needed if tokens are already strings)
-    Returns:
-        HTML string representation of the table
+    Convert token sequence to HTML table structure.
+    Robust to common prediction errors (duplicate tags, missing row markers, etc.)
     """
     from tsr.data.serialization import (
         TABLE_START, TABLE_END, ROW_START, ROW_END,
         CELL_START, CELL_END, HEADER_START, HEADER_END,
         XMIN_TOKEN, YMIN_TOKEN, XMAX_TOKEN, YMAX_TOKEN,
-        SEP_TOKEN, EOS_TOKEN
+        SEP_TOKEN, EOS_TOKEN, BOS_TOKEN
     )
-    
+
+    CELL_OPENERS = {CELL_START, HEADER_START}
+    CELL_CLOSERS = {CELL_END, HEADER_END}
+    STOP_TOKENS = (CELL_CLOSERS | {SEP_TOKEN, EOS_TOKEN, TABLE_END,
+                    ROW_START, ROW_END, TABLE_START} | CELL_OPENERS)
+
     html_parts = []
     i = 0
-    
+    in_table = False
+    in_row = False
+
+    def _is_bbox_token(t: str) -> bool:
+        return (t.startswith(XMIN_TOKEN) or t.startswith(YMIN_TOKEN) or
+                t.startswith(XMAX_TOKEN) or t.startswith(YMAX_TOKEN))
+
     while i < len(tokens):
         token = tokens[i]
-        
+
+        if token in (BOS_TOKEN, SEP_TOKEN):
+            i += 1
+            continue
+
         if token == TABLE_START:
-            html_parts.append("<table>")
+            if not in_table:
+                html_parts.append("<table>")
+                in_table = True
             i += 1
             continue
-        
+
         if token == TABLE_END or token == EOS_TOKEN:
-            html_parts.append("</table>")
+            if in_row:
+                html_parts.append("</tr>")
+                in_row = False
+            if in_table:
+                html_parts.append("</table>")
+                in_table = False
             break
-        
+
         if token == ROW_START:
+            if in_row:
+                html_parts.append("</tr>")
             html_parts.append("<tr>")
+            in_row = True
             i += 1
             continue
-        
+
         if token == ROW_END:
-            html_parts.append("</tr>")
+            if in_row:
+                html_parts.append("</tr>")
+                in_row = False
             i += 1
             continue
-        
-        if token in [CELL_START, HEADER_START]:
-            is_header = (token == HEADER_START)
-            tag = "th" if is_header else "td"
-            
-            # Check if next tokens are bbox tokens
+
+        if token in CELL_OPENERS:
+            if not in_table:
+                html_parts.append("<table>")
+                in_table = True
+            if not in_row:
+                html_parts.append("<tr>")
+                in_row = True
+
+            tag = "th" if token == HEADER_START else "td"
+
             has_bbox = (i + 4 < len(tokens) and
-                       tokens[i+1].startswith(XMIN_TOKEN) and
-                       tokens[i+2].startswith(YMIN_TOKEN) and
-                       tokens[i+3].startswith(XMAX_TOKEN) and
-                       tokens[i+4].startswith(YMAX_TOKEN))
-            
-            if has_bbox:
-                # Extract content after bbox tokens
-                content_start = i + 5
-            else:
-                # Extract content directly after cell start
-                content_start = i + 1
-            
-            # Find content end and extract content, filtering out bbox tokens
+                        tokens[i+1].startswith(XMIN_TOKEN) and
+                        tokens[i+2].startswith(YMIN_TOKEN) and
+                        tokens[i+3].startswith(XMAX_TOKEN) and
+                        tokens[i+4].startswith(YMAX_TOKEN))
+
+            content_start = i + 5 if has_bbox else i + 1
+
             content_tokens = []
             content_end = content_start
-            while (content_end < len(tokens) and 
-                   tokens[content_end] not in [CELL_END, HEADER_END, SEP_TOKEN, EOS_TOKEN, TABLE_END,
-                                               ROW_START, ROW_END, TABLE_START]):
-                # Skip bbox tokens if they appear in content (shouldn't happen, but be safe)
-                token = tokens[content_end]
-                if not (token.startswith(XMIN_TOKEN) or token.startswith(YMIN_TOKEN) or 
-                        token.startswith(XMAX_TOKEN) or token.startswith(YMAX_TOKEN)):
-                    content_tokens.append(token)
+            while content_end < len(tokens) and tokens[content_end] not in STOP_TOKENS:
+                t = tokens[content_end]
+                if not _is_bbox_token(t):
+                    content_tokens.append(t)
                 content_end += 1
-            
+
             content = "".join(content_tokens)
-            # Escape HTML special characters
             content = content.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            
+
             html_parts.append(f"<{tag}>{content}</{tag}>")
-            i = content_end + 1
+
+            if content_end < len(tokens) and tokens[content_end] in CELL_CLOSERS:
+                i = content_end + 1
+            else:
+                i = content_end
             continue
-        
+
+        if token in CELL_CLOSERS:
+            i += 1
+            continue
+
         i += 1
-    
+
+    if in_row:
+        html_parts.append("</tr>")
+    if in_table and (not html_parts or html_parts[-1] != "</table>"):
+        html_parts.append("</table>")
+
     return "".join(html_parts)
 
 
@@ -166,6 +195,17 @@ def tree_edit_distance(tree1: ET.Element, tree2: ET.Element) -> int:
         return 1000
 
 
+def _sanitize_html(html: str) -> str:
+    """Fix common HTML issues that break XML parsing"""
+    html = re.sub(r'(<table>)+', '<table>', html)
+    html = re.sub(r'(</table>)+', '</table>', html)
+    if not html.startswith('<table>'):
+        html = '<table>' + html
+    if not html.endswith('</table>'):
+        html = html + '</table>'
+    return html
+
+
 def calculate_teds(pred_html: str, gt_html: str) -> float:
     """
     Calculate TEDS (Tree-Edit-Distance-based Similarity) score
@@ -179,32 +219,33 @@ def calculate_teds(pred_html: str, gt_html: str) -> float:
         TEDS score between 0 and 1 (higher is better)
     """
     try:
-        # Normalize HTML
         pred_html = normalize_html(pred_html)
         gt_html = normalize_html(gt_html)
-        
-        # Parse to XML trees
-        try:
-            pred_tree = ET.fromstring(f"<root>{pred_html}</root>")
-            gt_tree = ET.fromstring(f"<root>{gt_html}</root>")
-        except ET.ParseError:
-            # If HTML is malformed, try to fix or return low score
+
+        def _try_parse(html: str) -> Optional[ET.Element]:
+            for attempt in [html, _sanitize_html(html)]:
+                try:
+                    return ET.fromstring(f"<root>{attempt}</root>")
+                except ET.ParseError:
+                    continue
+            return None
+
+        pred_tree = _try_parse(pred_html)
+        gt_tree = _try_parse(gt_html)
+
+        if pred_tree is None or gt_tree is None:
             return 0.0
         
-        # Calculate tree edit distance
         edit_dist = tree_edit_distance(pred_tree, gt_tree)
         
-        # Get tree sizes
         pred_size = len(list(pred_tree.iter()))
         gt_size = len(list(gt_tree.iter()))
         max_size = max(pred_size, gt_size, 1)
         
-        # Calculate TEDS
         teds = 1.0 - (edit_dist / max_size)
-        return max(0.0, min(1.0, teds))  # Clamp between 0 and 1
+        return max(0.0, min(1.0, teds))
         
-    except Exception as e:
-        # If calculation fails, return 0
+    except Exception:
         return 0.0
 
 

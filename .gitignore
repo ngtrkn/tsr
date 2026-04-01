@@ -43,6 +43,9 @@ checkpoints/
 *.jpg
 *.png
 
+# Dataset cache
+.cache/
+
 # Logs
 logs/
 *.log
