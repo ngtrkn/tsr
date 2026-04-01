@@ -7,12 +7,14 @@ import torch
 from torch.utils.data import Dataset
 from PIL import Image
 import json
+import hashlib
 from typing import List, Dict, Tuple, Optional
 from pathlib import Path
 import numpy as np
 from .serialization import SequenceSerializer, TableData, CellData
 from tqdm import tqdm
 import os
+import time
 
 
 def collate_fn(batch: List[Dict]) -> Dict:
@@ -142,73 +144,165 @@ class TableDataset(Dataset):
         image_size: Tuple[int, int] = (512, 640),
         augment: bool = False,
         use_simplified_format: bool = False,
+        cache_dir: Optional[str] = None,
+        max_samples: Optional[int] = None,
     ):
         self.data_path = Path(data_path)
         self.image_size = image_size
         self.augment = augment
         self.use_simplified_format = use_simplified_format
-        
-        # Load data
+        self.serializer = SequenceSerializer()
+
+        # Load data pairs / items
         if use_simplified_format:
-            # Format 2: List of (image_path, label_path) tuples
             if self.data_path.is_file():
                 with open(self.data_path, 'r') as f:
                     self.data_pairs = json.load(f)
             else:
                 raise ValueError(f"Simplified format requires a JSON file, got: {data_path}")
-            
-            # Load all labels to build vocabulary
+
             self.data = []
             for image_path, label_path in self.data_pairs:
-                # with open(label_path, 'r') as f:
-                #     label_data = json.load(f)
-                #     # Add image_path to label data for compatibility
-                #     label_data['image_path'] = image_path
-                #     self.data.append(label_data) 
                 self.data.append(dict(image_path=image_path, label_path=label_path))
         else:
-            # Format 1: Legacy format (JSON file or directory)
             if self.data_path.is_file():
                 with open(self.data_path, 'r') as f:
                     self.data = json.load(f)
                     if not isinstance(self.data, list):
                         self.data = [self.data]
             elif self.data_path.is_dir():
-                # Load all JSON files in directory
                 self.data = []
                 for json_file in self.data_path.glob("*.json"):
                     with open(json_file, 'r') as f:
                         self.data.append(json.load(f))
             else:
                 raise ValueError(f"Invalid data path: {data_path}")
-            
-            self.data_pairs = None
-        
-        # Initialize serializer
-        self.serializer = SequenceSerializer()
-        
-        # Build vocabulary
-        if vocab is None:
-            # Create vocabulary from all sequences
-            with Pool(processes=4) as pool:
-                sequences = pool.map(self._load_single_sequence, self.data)
 
-            # sequences = []
-            
-            # pbar = tqdm(total=len(self.data))
-            # for item in self.data:
-            #     table = self._load_table(item)
-            #     seq = self.serializer.serialize_table(table)
-            #     sequences.append(seq)
-            #     # Update the progress bar manually by the desired increment
-            #     pbar.update(1) 
-            #     # Add a dynamic description to the bar
-            #     pbar.set_description(f"{os.path.basename(item['image_path'])}")
-            self.vocab = self.serializer.create_vocabulary(sequences)
-        else:
+            self.data_pairs = None
+
+        if max_samples is not None and max_samples < len(self.data):
+            print(f"[Debug] Limiting dataset from {len(self.data)} to {max_samples} samples")
+            self.data = self.data[:max_samples]
+            if self.data_pairs is not None:
+                self.data_pairs = self.data_pairs[:max_samples]
+
+        # Try to load from cache
+        cache_path = self._get_cache_path(cache_dir)
+        cached = self._load_cache(cache_path, vocab)
+
+        if cached:
+            self.vocab = cached["vocab"]
+            self._cached_items = cached["items"]
+            print(f"Loaded dataset cache ({len(self._cached_items)} samples) from {cache_path}")
+        elif vocab:
             self.vocab = vocab
-        
+            self._cached_items = None
+        else:
+            self._cached_items = None
+
+            if vocab is None:
+                with Pool(processes=4) as pool:
+                    sequences = pool.map(self._load_single_sequence, self.data)
+                self.vocab = self.serializer.create_vocabulary(sequences)
+            else:
+                self.vocab = vocab
+
+            self._build_and_save_cache(cache_path)
+
         self.id_to_token = {v: k for k, v in self.vocab.items()}
+
+    def _get_cache_path(self, cache_dir: Optional[str] = None) -> Path:
+        """Derive a cache file path from a hash of the dataset config."""
+        with open(self.data_path, 'rb') as f:
+            data_hash = hashlib.md5(f.read()).hexdigest()[:12]
+        tag = f"{data_hash}_{'simplified' if self.use_simplified_format else 'legacy'}"
+
+        if cache_dir:
+            base = Path(cache_dir)
+        else:
+            base = self.data_path.parent / ".cache"
+        base.mkdir(parents=True, exist_ok=True)
+        return base / f"dataset_{tag}.pt"
+
+    def _load_cache(self, cache_path: Path, external_vocab: Optional[Dict[str, int]]) -> Optional[Dict]:
+        """Load cache if it exists and is compatible."""
+        if not cache_path.exists():
+            return None
+        try:
+            t0 = time.time()
+            cache = torch.load(cache_path, map_location="cpu", weights_only=False)
+            if cache.get("num_samples") != len(self.data):
+                print(f"Cache sample count mismatch ({cache.get('num_samples')} vs {len(self.data)}), rebuilding...")
+                return None
+            if external_vocab is not None and external_vocab != cache.get("vocab"):
+                print("Cache vocab mismatch with provided vocab, rebuilding...")
+                return None
+            elapsed = time.time() - t0
+            print(f"Cache loaded in {elapsed:.1f}s")
+            return cache
+        except Exception as e:
+            print(f"Failed to load cache ({e}), rebuilding...")
+            return None
+
+    def _build_and_save_cache(self, cache_path: Path):
+        """Preprocess all samples and save to cache."""
+        print(f"Building dataset cache for {len(self.data)} samples...")
+        t0 = time.time()
+
+        items = []
+        for idx in tqdm(range(len(self.data)), desc="Caching sequences"):
+            item = self._preprocess_item(idx)
+            items.append(item)
+
+        self._cached_items = items
+
+        cache = {
+            "vocab": self.vocab,
+            "items": items,
+            "num_samples": len(self.data),
+        }
+        try:
+            torch.save(cache, cache_path)
+            elapsed = time.time() - t0
+            size_mb = cache_path.stat().st_size / (1024 * 1024)
+            print(f"Saved dataset cache ({size_mb:.1f} MB) to {cache_path} in {elapsed:.1f}s")
+        except Exception as e:
+            print(f"Warning: could not save cache: {e}")
+
+    def _preprocess_item(self, idx: int) -> Dict:
+        """Preprocess a single item (everything except image loading)."""
+        if self.use_simplified_format:
+            image_path, label_path = self.data_pairs[idx]
+            with open(label_path, 'r') as f:
+                item = json.load(f)
+        else:
+            item = self.data[idx]
+            image_path = item["image_path"]
+
+        table = self._load_table(item)
+        tokens = self.serializer.serialize_table(table)
+        token_ids = self.serializer.tokens_to_ids(tokens, self.vocab)
+
+        input_ids = [self.vocab["<BOS>"]]
+        input_ids.extend(token_ids[:-1])
+
+        struct_mask, cont_mask = self._create_masks(tokens)
+        bbox_data = self._extract_bboxes(tokens, table)
+
+        result = {
+            "image_path": image_path,
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "token_ids": torch.tensor(token_ids, dtype=torch.long),
+            "structure_mask": struct_mask,
+            "content_mask": cont_mask,
+        }
+
+        if bbox_data is not None:
+            bboxes, bbox_mask = bbox_data
+            result["bboxes"] = bboxes
+            result["bbox_mask"] = bbox_mask
+
+        return result
 
     def _load_single_sequence(self, item: Dict) -> List[str]:
         table = self._load_table(item)
@@ -320,50 +414,25 @@ class TableDataset(Dataset):
         return len(self.data)
     
     def __getitem__(self, idx: int) -> Dict:
-        if self.use_simplified_format:
-            # Format 2: Get image and label paths from pairs
-            image_path, label_path = self.data_pairs[idx]
-            
-            # Load label
-            with open(label_path, 'r') as f:
-                item = json.load(f)
-        else:
-            # Format 1: Legacy format
-            item = self.data[idx]
-            image_path = item["image_path"]
-        
-        # Load image
-        image = self._load_image(image_path)
-        
-        # Load table and serialize
-        table = self._load_table(item)
-        tokens = self.serializer.serialize_table(table)
-        
-        # Convert to token IDs
-        token_ids = self.serializer.tokens_to_ids(tokens, self.vocab)
-        
-        # Create right-shifted input (for training)
-        input_ids = [self.vocab["<BOS>"]]
-        input_ids.extend(token_ids[:-1])
-        
-        # Create masks
-        struct_mask, cont_mask = self._create_masks(tokens)
-        
-        # Extract bboxes
-        bbox_data = self._extract_bboxes(tokens, table)
-        
-        result = {
-            "image": image,
-            "input_ids": torch.tensor(input_ids, dtype=torch.long),
-            "token_ids": torch.tensor(token_ids, dtype=torch.long),
-            "structure_mask": struct_mask,
-            "content_mask": cont_mask,
-        }
-        
-        if bbox_data is not None:
-            bboxes, bbox_mask = bbox_data
-            result["bboxes"] = bboxes
-            result["bbox_mask"] = bbox_mask
-        
-        return result
+        if self._cached_items is not None:
+            cached = self._cached_items[idx]
+            image = self._load_image(cached["image_path"])
+            result = {
+                "image": image,
+                "input_ids": cached["input_ids"],
+                "token_ids": cached["token_ids"],
+                "structure_mask": cached["structure_mask"],
+                "content_mask": cached["content_mask"],
+            }
+            if "bboxes" in cached:
+                result["bboxes"] = cached["bboxes"]
+                result["bbox_mask"] = cached["bbox_mask"]
+            return result
+
+        # Fallback: process on the fly
+        preprocessed = self._preprocess_item(idx)
+        image = self._load_image(preprocessed["image_path"])
+        preprocessed["image"] = image
+        del preprocessed["image_path"]
+        return preprocessed
 

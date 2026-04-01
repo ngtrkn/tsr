@@ -17,6 +17,7 @@ from experiments.experiment_framework import (
     create_improvement_experiments,
 )
 from tsr.data.dataset import TableDataset
+from tsr.utils.vocab import load_vocab_auto
 
 
 def main():
@@ -73,13 +74,26 @@ def main():
         default=5,
         help="Number of training epochs"
     )
+    parser.add_argument(
+        "--vocab",
+        type=str,
+        default=None,
+        help="Path to vocab file (.txt or .json) to use instead of building from data"
+    )
     
     args = parser.parse_args()
     
+    # Load external vocab if provided
+    ext_vocab = None
+    if args.vocab:
+        ext_vocab = load_vocab_auto(args.vocab)
+        print(f"Loaded external vocabulary ({len(ext_vocab)} tokens) from {args.vocab}")
+
     # Create data loaders
     print("Loading datasets...")
     train_dataset = TableDataset(
         data_path=args.data_path,
+        vocab=ext_vocab,
         image_size=(512, 640),
         augment=False,
     )

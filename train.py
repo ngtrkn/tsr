@@ -11,6 +11,7 @@ from tsr.models.model import TableRecognitionModel
 from tsr.data.dataset import TableDataset
 from tsr.losses.losses import MultiTaskLoss
 from tsr.training.trainer import Trainer
+from tsr.utils.vocab import load_vocab_auto
 
 
 def load_config(config_path: str):
@@ -39,10 +40,11 @@ def create_model(config: dict, vocab_size: int):
     return model
 
 
-def create_dataloaders(config: dict):
+def create_dataloaders(config: dict, vocab=None):
     """Create data loaders"""
     train_dataset = TableDataset(
         data_path=config["data"]["train_path"],
+        vocab=vocab,
         image_size=tuple(config["data"]["image_size"]),
         augment=config["data"].get("augment", False),
     )
@@ -51,7 +53,7 @@ def create_dataloaders(config: dict):
     if "val_path" in config["data"]:
         val_dataset = TableDataset(
             data_path=config["data"]["val_path"],
-            vocab=train_dataset.vocab,  # Use same vocabulary
+            vocab=train_dataset.vocab,
             image_size=tuple(config["data"]["image_size"]),
             augment=False,
         )
@@ -82,15 +84,22 @@ def main():
     parser.add_argument("--config", type=str, required=True, help="Path to config file")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     parser.add_argument("--device", type=str, default="cuda", help="Device to use")
+    parser.add_argument("--vocab", type=str, default=None, help="Path to vocab file (.txt or .json) to use instead of building from data")
     
     args = parser.parse_args()
     
     # Load config
     config = load_config(args.config)
     
+    # Load external vocab if provided
+    vocab = None
+    if args.vocab:
+        vocab = load_vocab_auto(args.vocab)
+        print(f"Loaded external vocabulary ({len(vocab)} tokens) from {args.vocab}")
+
     # Create data loaders
     print("Loading datasets...")
-    train_loader, val_loader, vocab = create_dataloaders(config)
+    train_loader, val_loader, vocab = create_dataloaders(config, vocab=vocab)
     vocab_size = len(vocab)
     print(f"Vocabulary size: {vocab_size}")
     
