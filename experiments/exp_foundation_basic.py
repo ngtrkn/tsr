@@ -18,8 +18,9 @@ sys.path.insert(0, str(project_root))
 
 from torch.utils.data import DataLoader
 from pathlib import Path
-from experiments.base_experiment import ExperimentConfig, run_experiment
+from experiments.base_experiment import ExperimentConfig, run_experiment, run_validation_only
 from tsr.data.dataset import TableDataset, collate_fn
+from tsr.utils.vocab import load_vocab_auto
 
 
 def main():
@@ -27,14 +28,14 @@ def main():
     parser.add_argument(
         "--data_path",
         type=str,
-        required=True,
-        help="Path to training data (JSON file or directory)"
+        default=None,
+        help="Path to training data (JSON file or directory). Required unless --validate_only."
     )
     parser.add_argument(
         "--val_path",
         type=str,
         default=None,
-        help="Path to validation data (optional)"
+        help="Path to validation data"
     )
     parser.add_argument(
         "--output_dir",
@@ -72,96 +73,166 @@ def main():
         default=None,
         help="Path to checkpoint to resume from (e.g., 'latest.pth', 'best.pth', 'epoch_5.pth', or full path)"
     )
+    parser.add_argument(
+        "--validate_only",
+        action="store_true",
+        help="Run validation only (requires --resume or --val_path with existing checkpoint)"
+    )
+    parser.add_argument(
+        "--num_inference_samples",
+        type=int,
+        default=3,
+        help="Number of random inference samples to display during validation-only mode"
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Debug mode: limit dataset to 100 samples for quick testing"
+    )
+    parser.add_argument(
+        "--vocab",
+        type=str,
+        default=None,
+        help="Path to vocab file (.txt or .json) to use instead of building from data"
+    )
     
     args = parser.parse_args()
-    
-    # Create data loaders
-    print("Loading datasets...")
-    
-    # Check if using simplified format (dataset_list.json)
-    use_simplified = Path(args.data_path).name == "dataset_list.json" or "dataset_list" in args.data_path
-    
+
+    max_samples = 100 if args.debug else None
+    if args.debug:
+        print("[Debug mode] Limiting datasets to 100 samples")
+
     # Use smaller image size for memory efficiency
     image_size = (512, 640)
-    # image_size = (384, 512)  # Reduced from (512, 640)
-    
-    train_dataset = TableDataset(
-        data_path=args.data_path,
-        image_size=image_size,
-        augment=False,
-        use_simplified_format=use_simplified,
-    )
-    
-    val_dataset = None
-    if args.val_path:
-        val_dataset = TableDataset(
-            data_path=args.val_path,
-            vocab=train_dataset.vocab,
-            image_size=image_size,
-            augment=False,
-            use_simplified_format=use_simplified,
-        )
-    
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        # num_workers=0,  # Set to 0 to avoid multiprocessing issues
-        pin_memory=False, #True if args.device == "cuda" else False,
-        collate_fn=collate_fn,
-    )
-    
-    val_loader = None
-    if val_dataset:
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=args.batch_size,
-            shuffle=False,
-            # num_workers=0,  # Set to 0 to avoid multiprocessing issues
-            pin_memory= False, #True if args.device == "cuda" else False,
-            collate_fn=collate_fn,
-        )
-    
-    print(f"Training samples: {len(train_dataset)}")
-    if val_dataset:
-        print(f"Validation samples: {len(val_dataset)}")
-    print(f"Vocabulary size: {len(train_dataset.vocab)}")
-    
-    # Create experiment config (optimized for extreme memory savings)
+
+    # Create experiment config
     config = ExperimentConfig(
         name="Foundation_Basic",
         phase="foundation",
-        encoder_backbone="resnet31",  # Smallest encoder for memory savings
-        embed_dim=384,  # Further reduced for extreme memory savings
-        decoder_layers=3,  # Further reduced for extreme memory savings
-        decoder_heads=6,  # Reduced for memory savings
-        ffn_dim=1536,  # Further reduced for extreme memory savings
+        encoder_backbone="resnet31",
+        embed_dim=384,
+        decoder_layers=3,
+        decoder_heads=6,
+        ffn_dim=1536,
         dropout=0.1,
         use_unified_ce_loss=True,
         use_hybrid_regression=False,
         use_html_refiner=False,
         use_gc_attention=False,
         use_parallel_decoder=False,
-        token_compression=0.8,  # Enable token compression (20% reduction)
-        batch_size=args.batch_size if args.batch_size else 1,  # Minimum batch size
+        token_compression=0.8,
+        batch_size=args.batch_size if args.batch_size else 1,
         num_epochs=args.num_epochs,
         learning_rate=args.learning_rate,
-        gradient_accumulation_steps=8 // args.batch_size,  # Effective batch size = 1 * 8 = 8
-        use_mixed_precision=True,  # FP16 for memory efficiency
-        gradient_checkpointing=True,  # Enabled by default for extreme memory savings
+        gradient_accumulation_steps=8 // args.batch_size,
+        use_mixed_precision=True,
+        gradient_checkpointing=True,
         image_size=image_size,
     )
-    
-    # Run experiment (pass vocabulary for checkpoint saving)
-    run_experiment(
-        config=config,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        device=args.device,
-        output_dir=args.output_dir,
-        vocab=train_dataset.vocab,
-        resume_from=args.resume,
-    )
+
+    ext_vocab = None
+    if args.vocab:
+        ext_vocab = load_vocab_auto(args.vocab)
+        print(f"Loaded external vocabulary ({len(ext_vocab)} tokens) from {args.vocab}")
+
+    if args.validate_only:
+        if not args.val_path:
+            parser.error("--val_path is required for --validate_only")
+
+        checkpoint = args.resume
+        if checkpoint is None:
+            checkpoint = str(Path(args.output_dir) / "checkpoints" / "Foundation_Basic" / "latest.pth")
+            print(f"No --resume specified, using default: {checkpoint}")
+
+        use_simplified = Path(args.val_path).name == "dataset_list.json" or "dataset_list" in args.val_path
+
+        print("Loading validation dataset...")
+        val_dataset = TableDataset(
+            data_path=args.val_path,
+            vocab=ext_vocab,
+            image_size=image_size,
+            augment=False,
+            use_simplified_format=use_simplified,
+            max_samples=max_samples,
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            pin_memory=False,
+            collate_fn=collate_fn,
+        )
+        print(f"Validation samples: {len(val_dataset)}")
+        print(f"Vocabulary size: {len(val_dataset.vocab)}")
+
+        run_validation_only(
+            config=config,
+            val_loader=val_loader,
+            device=args.device,
+            output_dir=args.output_dir,
+            vocab=val_dataset.vocab,
+            checkpoint_path=checkpoint,
+            num_inference_samples=args.num_inference_samples,
+        )
+    else:
+        if not args.data_path:
+            parser.error("--data_path is required for training")
+
+        use_simplified = Path(args.data_path).name == "dataset_list.json" or "dataset_list" in args.data_path
+
+        print("Loading datasets...")
+        train_dataset = TableDataset(
+            data_path=args.data_path,
+            vocab=ext_vocab,
+            image_size=image_size,
+            augment=False,
+            use_simplified_format=use_simplified,
+            max_samples=max_samples,
+        )
+
+        val_dataset = None
+        if args.val_path:
+            val_dataset = TableDataset(
+                data_path=args.val_path,
+                vocab=train_dataset.vocab,
+                image_size=image_size,
+                augment=False,
+                use_simplified_format=use_simplified,
+                max_samples=max_samples,
+            )
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            pin_memory=False,
+            collate_fn=collate_fn,
+        )
+
+        val_loader = None
+        if val_dataset:
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=args.batch_size,
+                shuffle=False,
+                pin_memory=False,
+                collate_fn=collate_fn,
+            )
+
+        print(f"Training samples: {len(train_dataset)}")
+        if val_dataset:
+            print(f"Validation samples: {len(val_dataset)}")
+        print(f"Vocabulary size: {len(train_dataset.vocab)}")
+
+        run_experiment(
+            config=config,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            device=args.device,
+            output_dir=args.output_dir,
+            vocab=train_dataset.vocab,
+            resume_from=args.resume,
+        )
 
 
 if __name__ == "__main__":

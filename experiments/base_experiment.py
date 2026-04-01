@@ -420,6 +420,77 @@ def get_model_size(model):
     return (param_size + buffer_size) / (1024 ** 2)
 
 
+def run_validation_only(
+    config: ExperimentConfig,
+    val_loader: DataLoader,
+    device: str = "cuda",
+    output_dir: str = "./experiment_results",
+    vocab: Optional[Dict[str, int]] = None,
+    checkpoint_path: str = None,
+    num_inference_samples: int = 3,
+) -> Dict:
+    """Load a checkpoint and run validation only (no training)"""
+    print(f"\n{'='*60}")
+    print(f"Validation Only: {config.name}")
+    print(f"Checkpoint: {checkpoint_path}")
+    print(f"{'='*60}")
+
+    output_dir = Path(output_dir)
+
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    if checkpoint.get("vocab") is not None:
+        vocab = checkpoint["vocab"]
+        print(f"  Loaded vocab from checkpoint ({len(vocab)} tokens)")
+
+    vocab_size = len(vocab) if vocab else len(val_loader.dataset.vocab)
+
+    model = create_model(config, vocab_size)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model = model.to(device)
+    print(f"  Loaded model weights (epoch {checkpoint.get('epoch', '?')})")
+
+    criterion = create_loss_function(config)
+
+    scaler = None
+    if config.use_mixed_precision and device == "cuda":
+        scaler = torch.cuda.amp.GradScaler()
+        if "scaler_state_dict" in checkpoint:
+            scaler.load_state_dict(checkpoint["scaler_state_dict"])
+
+    print(f"\nRunning validation on {len(val_loader.dataset)} samples...")
+    val_metrics = validate(model, val_loader, criterion, device, config, scaler, vocab=vocab)
+
+    print(f"\n{'='*60}")
+    print(f"Validation Results")
+    print(f"{'='*60}")
+    print(f"  Loss:               {val_metrics['loss']:.4f}")
+    print(f"  Perplexity:         {val_metrics['perplexity']:.2f}")
+    print(f"  Token Accuracy:     {val_metrics['token_accuracy']:.2f}%")
+    print(f"  Structure Accuracy: {val_metrics['structure_accuracy']:.2f}%")
+    print(f"  Content Accuracy:   {val_metrics['content_accuracy']:.2f}%")
+    print(f"  Exact Match Rate:   {val_metrics['exact_match_rate']:.2f}%")
+    print(f"  TEDS:               {val_metrics['teds']:.4f}")
+
+    for i in range(num_inference_samples):
+        try:
+            perform_random_inference(model, val_loader, vocab, device, config, epoch=0)
+        except Exception as e:
+            print(f"Warning: inference sample {i+1} failed: {e}")
+
+    results = {
+        "config": asdict(config),
+        "val_metrics": val_metrics,
+        "checkpoint": str(checkpoint_path),
+    }
+
+    results_path = output_dir / f"{config.name}_val_results.json"
+    with open(results_path, 'w') as f:
+        json.dump(results, f, indent=2)
+    print(f"\nResults saved to {results_path}")
+
+    return results
+
+
 def run_experiment(
     config: ExperimentConfig,
     train_loader: DataLoader,
