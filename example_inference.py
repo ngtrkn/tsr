@@ -16,6 +16,7 @@ sys.path.insert(0, str(project_root))
 
 from tsr.models.model import TableRecognitionModel
 from tsr.data.serialization import SequenceSerializer, PAD_TOKEN, BOS_TOKEN, EOS_TOKEN
+from tsr.metrics.tsr_metrics import tokens_to_html
 
 
 def load_checkpoint(checkpoint_path: str, device: str = "cuda"):
@@ -59,24 +60,60 @@ def load_checkpoint(checkpoint_path: str, device: str = "cuda"):
     return model, vocab, config_dict
 
 
-def preprocess_image(image_path: str, image_size=(384, 512)):
-    """Preprocess image for inference"""
+def preprocess_image(
+    image_path: str,
+    image_size=(384, 512),
+    pad_frac: float = 0.2,
+):
+    """
+    Load image, pad canvas by ``pad_frac`` (e.g. 0.15 → 1.15× width/height, centered on white),
+    resize to ``image_size``, normalize for the encoder.
+
+    Returns:
+        tensor (1,C,H,W), original (width, height), padding info (pad_left, pad_top, padded_w, padded_h)
+    """
     image = Image.open(image_path).convert("RGB")
-    orig_size = image.size  # (width, height)
-    
-    # Resize
-    image = image.resize(image_size, Image.BILINEAR)
-    
-    # Convert to tensor and normalize
-    image_array = np.array(image).astype(np.float32) / 255.0
-    image_tensor = torch.from_numpy(image_array).permute(2, 0, 1)  # (C, H, W)
-    
-    # Normalize (ImageNet stats)
+    w, h = image.size
+    orig_size = (w, h)
+
+    new_w = max(1, int(round(w * (1.0 + pad_frac))))
+    new_h = max(1, int(round(h * (1.0 + pad_frac))))
+    pad_left = (new_w - w) // 2
+    pad_top = (new_h - h) // 2
+
+    padded = Image.new("RGB", (new_w, new_h), (255, 255, 255))
+    padded.paste(image, (pad_left, pad_top))
+
+    resized = padded.resize(image_size, Image.BILINEAR)
+    image_array = np.array(resized).astype(np.float32) / 255.0
+    image_tensor = torch.from_numpy(image_array).permute(2, 0, 1)
+
     mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
     std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
     image_tensor = (image_tensor - mean) / std
-    
-    return image_tensor.unsqueeze(0), orig_size  # (1, C, H, W)
+
+    pad_info = (pad_left, pad_top, new_w, new_h)
+    return image_tensor.unsqueeze(0), orig_size, pad_info
+
+
+def trim_table_bboxes_to_original(
+    table: dict,
+    pad_left: int,
+    pad_top: int,
+    orig_w: int,
+    orig_h: int,
+) -> None:
+    """Map cell bboxes from padded-canvas coordinates to the original image; update table size fields."""
+    table["image_width"] = orig_w
+    table["image_height"] = orig_h
+    for cell in table.get("cells", []):
+        x0, y0, x1, y1 = cell["bbox"]
+        cell["bbox"] = [
+            max(0.0, min(float(orig_w), x0 - pad_left)),
+            max(0.0, min(float(orig_h), y0 - pad_top)),
+            max(0.0, min(float(orig_w), x1 - pad_left)),
+            max(0.0, min(float(orig_h), y1 - pad_top)),
+        ]
 
 
 def ids_to_tokens(token_ids: torch.Tensor, vocab: dict):
@@ -178,6 +215,36 @@ def parse_sequence_to_table(tokens: list, serializer: SequenceSerializer,
     return table
 
 
+def save_table_visualization(image_path: str, table: dict, output_path: Path) -> None:
+    """Draw predicted cell boxes and labels on the original image and save."""
+    from PIL import ImageDraw, ImageFont
+
+    img = Image.open(image_path).convert("RGB")
+    draw = ImageDraw.Draw(img)
+    try:
+        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 10)
+    except OSError:
+        font_small = ImageFont.load_default()
+
+    for cell in table.get("cells", []):
+        bbox = cell["bbox"]
+        xmin, ymin, xmax, ymax = bbox
+        outline = (255, 0, 0) if cell.get("is_header") else (0, 255, 0)
+        draw.rectangle([xmin, ymin, xmax, ymax], outline=outline, width=2)
+        content = cell.get("content") or ""
+        if content:
+            text = content[:30] + ("..." if len(content) > 30 else "")
+            try:
+                tb = draw.textbbox((xmin + 2, ymin + 2), text, font=font_small)
+                draw.rectangle(tb, fill=(255, 255, 255, 200))
+            except Exception:
+                pass
+            draw.text((xmin + 2, ymin + 2), text, fill=(0, 0, 0), font=font_small)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    img.save(output_path)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Inference example using saved checkpoint")
     parser.add_argument(
@@ -216,6 +283,14 @@ def main():
         default=1.0,
         help="Sampling temperature"
     )
+    parser.add_argument(
+        "--visualize",
+        type=str,
+        nargs="?",
+        const="__auto__",
+        default=None,
+        help="Save bbox overlay on the input image; optional path (default: <output-stem>.viz.png if --output set, else <image-stem>_viz.png)",
+    )
     
     args = parser.parse_args()
     
@@ -223,11 +298,13 @@ def main():
     model, vocab, config = load_checkpoint(args.checkpoint, args.device)
     
     # Get image size from config
-    image_size = tuple(config.get("image_size", (384, 512)))
+    image_size = tuple(config.get("image_size", (512, 640)))
     
     # Preprocess image
     print(f"\nLoading image from {args.image}...")
-    image_tensor, (orig_width, orig_height) = preprocess_image(args.image, image_size)
+    image_tensor, (orig_width, orig_height), (pad_left, pad_top, padded_w, padded_h) = preprocess_image(
+        args.image, image_size
+    )
     image_tensor = image_tensor.to(args.device)
     
     # Generate
@@ -244,20 +321,43 @@ def main():
     print(f"\nGenerated {len(tokens)} tokens")
     print(f"First 50 tokens: {tokens[:50]}")
     
-    # Parse to table
+    # Parse to table (grid → padded canvas px); then map bboxes back to original image
     serializer = SequenceSerializer()
-    table = parse_sequence_to_table(tokens, serializer, orig_width, orig_height)
+    table = parse_sequence_to_table(tokens, serializer, padded_w, padded_h)
+    trim_table_bboxes_to_original(table, pad_left, pad_top, orig_width, orig_height)
     
     print(f"\nParsed table with {len(table['cells'])} cells")
     
+    markdown_html = tokens_to_html(tokens, vocab)
+    
     # Save output
     if args.output:
-        with open(args.output, 'w') as f:
+        out_path = Path(args.output)
+        with open(out_path, 'w') as f:
             json.dump(table, f, indent=2)
-        print(f"\nOutput saved to {args.output}")
+        md_html_path = out_path.with_name(out_path.stem + ".markdown.html")
+        with open(md_html_path, 'w', encoding='utf-8') as f:
+            f.write(markdown_html)
+        print(f"\nOutput saved to {out_path}")
+        print(f"Markdown HTML saved to {md_html_path}")
     else:
         print("\nTable structure:")
         print(json.dumps(table, indent=2))
+        print("\nMarkdown HTML:\n```html")
+        print(markdown_html)
+        print("```")
+    
+    if args.visualize is not None:
+        if args.visualize == "__auto__":
+            if args.output:
+                viz_path = Path(args.output).with_name(Path(args.output).stem + ".viz.png")
+            else:
+                ip = Path(args.image)
+                viz_path = ip.with_name(ip.stem + "_viz.png")
+        else:
+            viz_path = Path(args.visualize)
+        save_table_visualization(args.image, table, viz_path)
+        print(f"\nVisualization saved to {viz_path}")
 
 
 if __name__ == "__main__":
