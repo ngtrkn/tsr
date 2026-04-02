@@ -13,6 +13,7 @@ SEP_TOKEN = "<Sep>"
 PAD_TOKEN = "<Pad>"
 BOS_TOKEN = "<BOS>"
 EOS_TOKEN = "<EOS>"
+LINESEP_TOKEN = "<LineSep>"
 
 # Structural HTML tokens
 TABLE_START = "<table>"
@@ -90,28 +91,28 @@ class CoordinateDiscretizer:
 class SequenceSerializer:
     """Serializes table data into unified autoregressive sequence"""
     
-    def __init__(self, grid_width: int = GRID_WIDTH, grid_height: int = GRID_HEIGHT):
+    def __init__(self, grid_width: int = GRID_WIDTH, grid_height: int = GRID_HEIGHT,
+                 include_coordinates: bool = True):
         self.discretizer = CoordinateDiscretizer(grid_width, grid_height)
         self.grid_width = grid_width
         self.grid_height = grid_height
+        self.include_coordinates = include_coordinates
     
     def serialize_table(self, table: TableData) -> List[str]:
         """
-        Serialize table into unified sequence: y = {c, b, t, <Sep>}
-        where c = content, b = bbox tokens, t = structural HTML tags
+        Serialize table into unified sequence.
+
+        With coordinates:  y = {t, b, c, <Sep>}
+        Without (coord-free): y = {t, c_with_linesep, <Sep>}
         """
         sequence = [BOS_TOKEN, TABLE_START]
         
-        # Group cells by rows (assuming cells are ordered)
-        # In practice, you'd need row detection logic
         current_row = []
         prev_y = None
         
         for cell in table.cells:
-            # Simple row detection: if ymin changes significantly, new row
             _, ymin, _, _ = cell.bbox
             if prev_y is not None and abs(ymin - prev_y) > 10:
-                # End previous row and start new one
                 if current_row:
                     sequence.extend(self._serialize_row(current_row, table))
                     sequence.append(ROW_END)
@@ -123,7 +124,6 @@ class SequenceSerializer:
             current_row.append(cell)
             prev_y = ymin
         
-        # Serialize last row
         if current_row:
             sequence.extend(self._serialize_row(current_row, table))
             sequence.append(ROW_END)
@@ -138,25 +138,24 @@ class SequenceSerializer:
         row_tokens = []
         
         for cell in cells:
-            # Structural tag
             tag_start = HEADER_START if cell.is_header else CELL_START
             row_tokens.append(tag_start)
             
-            # Bounding box tokens (spatial tokens)
-            bbox_tokens = self.discretizer.continuous_to_tokens(
-                cell.bbox, table.image_width, table.image_height
-            )
-            row_tokens.extend(bbox_tokens)
+            if self.include_coordinates:
+                bbox_tokens = self.discretizer.continuous_to_tokens(
+                    cell.bbox, table.image_width, table.image_height
+                )
+                row_tokens.extend(bbox_tokens)
             
-            # Content tokens (character-level)
-            content_tokens = list(cell.content)
-            row_tokens.extend(content_tokens)
+            # Content tokens: split on newlines to produce textlines with <LineSep>
+            lines = cell.content.split('\n') if '\n' in cell.content else [cell.content]
+            for i, line in enumerate(lines):
+                if i > 0:
+                    row_tokens.append(LINESEP_TOKEN)
+                row_tokens.extend(list(line))
             
-            # Closing tag
             tag_end = HEADER_END if cell.is_header else CELL_END
             row_tokens.append(tag_end)
-            
-            # Separator
             row_tokens.append(SEP_TOKEN)
         
         return row_tokens
@@ -176,30 +175,30 @@ class SequenceSerializer:
             CELL_END: 9,
             HEADER_START: 10,
             HEADER_END: 11,
-            XMIN_TOKEN: 12,
-            YMIN_TOKEN: 13,
-            XMAX_TOKEN: 14,
-            YMAX_TOKEN: 15,
+            LINESEP_TOKEN: 12,
         }
         
-        # Add coordinate tokens
-        for i in range(self.grid_width):
-            vocab[f"{XMIN_TOKEN}{i}"] = len(vocab)
-            vocab[f"{XMAX_TOKEN}{i}"] = len(vocab)
+        if self.include_coordinates:
+            vocab[XMIN_TOKEN] = len(vocab)
+            vocab[YMIN_TOKEN] = len(vocab)
+            vocab[XMAX_TOKEN] = len(vocab)
+            vocab[YMAX_TOKEN] = len(vocab)
+
+            for i in range(self.grid_width):
+                vocab[f"{XMIN_TOKEN}{i}"] = len(vocab)
+                vocab[f"{XMAX_TOKEN}{i}"] = len(vocab)
+            
+            for i in range(self.grid_height):
+                vocab[f"{YMIN_TOKEN}{i}"] = len(vocab)
+                vocab[f"{YMAX_TOKEN}{i}"] = len(vocab)
         
-        for i in range(self.grid_height):
-            vocab[f"{YMIN_TOKEN}{i}"] = len(vocab)
-            vocab[f"{YMAX_TOKEN}{i}"] = len(vocab)
-        
-        # Add character tokens (ASCII printable + common unicode)
-        for i in range(32, 127):  # ASCII printable
+        # ASCII printable + common unicode
+        for i in range(32, 127):
             vocab[chr(i)] = len(vocab)
         
-        # Add common unicode characters
         for char in "àáâãäåæçèéêëìíîïðñòóôõöøùúûüýþÿ":
             vocab[char] = len(vocab)
         
-        # Add tokens from sequences if provided
         if sequences:
             for seq in sequences:
                 for token in seq:

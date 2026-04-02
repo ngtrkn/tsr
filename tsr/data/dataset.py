@@ -11,7 +11,11 @@ import hashlib
 from typing import List, Dict, Tuple, Optional
 from pathlib import Path
 import numpy as np
-from .serialization import SequenceSerializer, TableData, CellData
+from .serialization import (
+    SequenceSerializer, TableData, CellData,
+    CELL_START, CELL_END, HEADER_START, HEADER_END, LINESEP_TOKEN,
+    XMIN_TOKEN, YMIN_TOKEN, XMAX_TOKEN, YMAX_TOKEN,
+)
 from tqdm import tqdm
 import os
 import time
@@ -98,6 +102,19 @@ def collate_fn(batch: List[Dict]) -> Dict:
             padded_bboxes.append(padded_bbox)
             padded_bbox_mask.append(padded_bbox_m)
         
+        # Pad cell_bbox_per_token if present (for spatial conditioning)
+        if "cell_bbox_per_token" in item:
+            cbt = item["cell_bbox_per_token"]  # (T, 4)
+            cbt_mask = item["cell_bbox_token_mask"]  # (T,)
+            if pad_len > 0:
+                cbt = torch.cat([cbt, torch.zeros((pad_len, 4), dtype=torch.float32)])
+                cbt_mask = torch.cat([cbt_mask, torch.zeros(pad_len, dtype=torch.bool)])
+            if "padded_cell_bbox_per_token" not in result:
+                result["_cell_bbox_per_token"] = []
+                result["_cell_bbox_token_mask"] = []
+            result.setdefault("_cell_bbox_per_token", []).append(cbt)
+            result.setdefault("_cell_bbox_token_mask", []).append(cbt_mask)
+
         images.append(item["image"])
     
     result = {
@@ -112,6 +129,10 @@ def collate_fn(batch: List[Dict]) -> Dict:
         result["bboxes"] = torch.stack(padded_bboxes)
         result["bbox_mask"] = torch.stack(padded_bbox_mask)
     
+    if "_cell_bbox_per_token" in result:
+        result["cell_bbox_per_token"] = torch.stack(result.pop("_cell_bbox_per_token"))
+        result["cell_bbox_token_mask"] = torch.stack(result.pop("_cell_bbox_token_mask"))
+
     return result
 
 
@@ -146,12 +167,14 @@ class TableDataset(Dataset):
         use_simplified_format: bool = False,
         cache_dir: Optional[str] = None,
         max_samples: Optional[int] = None,
+        coordinate_free: bool = False,
     ):
         self.data_path = Path(data_path)
         self.image_size = image_size
         self.augment = augment
         self.use_simplified_format = use_simplified_format
-        self.serializer = SequenceSerializer()
+        self.coordinate_free = coordinate_free
+        self.serializer = SequenceSerializer(include_coordinates=not coordinate_free)
 
         # Load data pairs / items
         if use_simplified_format:
@@ -215,7 +238,8 @@ class TableDataset(Dataset):
         """Derive a cache file path from a hash of the dataset config."""
         with open(self.data_path, 'rb') as f:
             data_hash = hashlib.md5(f.read()).hexdigest()[:12]
-        tag = f"{data_hash}_{'simplified' if self.use_simplified_format else 'legacy'}"
+        cf = "_cf" if self.coordinate_free else ""
+        tag = f"{data_hash}_{'simplified' if self.use_simplified_format else 'legacy'}{cf}"
 
         if cache_dir:
             base = Path(cache_dir)
@@ -302,6 +326,11 @@ class TableDataset(Dataset):
             result["bboxes"] = bboxes
             result["bbox_mask"] = bbox_mask
 
+        if self.coordinate_free:
+            cbt, cbt_mask = self._build_cell_bbox_per_token(tokens, table)
+            result["cell_bbox_per_token"] = cbt
+            result["cell_bbox_token_mask"] = cbt_mask
+
         return result
 
     def _load_single_sequence(self, item: Dict) -> List[str]:
@@ -355,7 +384,8 @@ class TableDataset(Dataset):
         """Create structure and content masks"""
         structure_tokens = {
             "<table>", "</table>", "<tr>", "</tr>", "<td>", "</td>",
-            "<th>", "</th>", "<Sep>", "<Xmin>", "<Ymin>", "<Xmax>", "<Ymax>"
+            "<th>", "</th>", "<Sep>", "<LineSep>",
+            "<Xmin>", "<Ymin>", "<Xmax>", "<Ymax>",
         }
         
         struct_mask = torch.zeros(len(tokens), dtype=torch.bool)
@@ -369,46 +399,104 @@ class TableDataset(Dataset):
         
         return struct_mask, cont_mask
     
-    def _extract_bboxes(self, tokens: List[str], table: TableData) -> Optional[torch.Tensor]:
-        """Extract bounding boxes from tokens"""
-        from .serialization import XMIN_TOKEN, YMIN_TOKEN, XMAX_TOKEN, YMAX_TOKEN
-        
+    def _extract_bboxes(self, tokens: List[str], table: TableData) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Extract per-token bounding boxes (used for regression targets).
+
+        In coordinate mode: parse discrete coordinate tokens.
+        In coordinate-free mode: assign the GT cell bbox at the <td>/<th> position.
+        """
+        if self.coordinate_free:
+            return self._extract_bboxes_coord_free(tokens, table)
+
         bboxes = []
         bbox_mask = []
-        
+
         i = 0
         while i < len(tokens):
-            if tokens[i] in ["<td>", "<th>"]:
-                # Extract bbox tokens
+            if tokens[i] in [CELL_START, HEADER_START]:
                 if (i + 4 < len(tokens) and
                     tokens[i+1].startswith(XMIN_TOKEN) and
                     tokens[i+2].startswith(YMIN_TOKEN) and
                     tokens[i+3].startswith(XMAX_TOKEN) and
                     tokens[i+4].startswith(YMAX_TOKEN)):
-                    
+
                     xmin = int(tokens[i+1].replace(XMIN_TOKEN, ""))
                     ymin = int(tokens[i+2].replace(YMIN_TOKEN, ""))
                     xmax = int(tokens[i+3].replace(XMAX_TOKEN, ""))
                     ymax = int(tokens[i+4].replace(YMAX_TOKEN, ""))
-                    
-                    # Normalize to [0, 1]
+
                     x = (xmin + xmax) / 2.0 / self.serializer.grid_width
                     y = (ymin + ymax) / 2.0 / self.serializer.grid_height
                     w = (xmax - xmin) / self.serializer.grid_width
                     h = (ymax - ymin) / self.serializer.grid_height
-                    
+
                     bboxes.append([x, y, w, h])
                     bbox_mask.append(True)
                     i += 5
                     continue
-            
+
             bboxes.append([0, 0, 0, 0])
             bbox_mask.append(False)
             i += 1
-        
+
         if len(bboxes) > 0:
             return torch.tensor(bboxes, dtype=torch.float32), torch.tensor(bbox_mask, dtype=torch.bool)
         return None
+
+    def _extract_bboxes_coord_free(self, tokens: List[str], table: TableData) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """In coordinate-free mode, place normalized GT cell bbox at each <td>/<th> position."""
+        bboxes = torch.zeros((len(tokens), 4), dtype=torch.float32)
+        bbox_mask = torch.zeros(len(tokens), dtype=torch.bool)
+
+        cell_idx = 0
+        for i, token in enumerate(tokens):
+            if token in [CELL_START, HEADER_START] and cell_idx < len(table.cells):
+                cell = table.cells[cell_idx]
+                xmin, ymin, xmax, ymax = cell.bbox
+                bboxes[i] = torch.tensor([
+                    (xmin + xmax) / 2.0 / table.image_width,
+                    (ymin + ymax) / 2.0 / table.image_height,
+                    (xmax - xmin) / table.image_width,
+                    (ymax - ymin) / table.image_height,
+                ], dtype=torch.float32)
+                bbox_mask[i] = True
+                cell_idx += 1
+
+        return bboxes, bbox_mask
+
+    def _build_cell_bbox_per_token(self, tokens: List[str], table: TableData) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Build per-token cell bbox tensor for spatial conditioning.
+
+        For every content token inside a cell, stores the normalized GT cell bbox.
+        Used to condition content generation on the cell's spatial location.
+        """
+        cbt = torch.zeros((len(tokens), 4), dtype=torch.float32)
+        cbt_mask = torch.zeros(len(tokens), dtype=torch.bool)
+
+        cell_idx = 0
+        in_cell = False
+        current_bbox = None
+
+        for i, token in enumerate(tokens):
+            if token in [CELL_START, HEADER_START] and cell_idx < len(table.cells):
+                cell = table.cells[cell_idx]
+                xmin, ymin, xmax, ymax = cell.bbox
+                current_bbox = torch.tensor([
+                    (xmin + xmax) / 2.0 / table.image_width,
+                    (ymin + ymax) / 2.0 / table.image_height,
+                    (xmax - xmin) / table.image_width,
+                    (ymax - ymin) / table.image_height,
+                ], dtype=torch.float32)
+                in_cell = True
+                cell_idx += 1
+            elif token in [CELL_END, HEADER_END]:
+                in_cell = False
+                current_bbox = None
+            elif in_cell and current_bbox is not None:
+                cbt[i] = current_bbox
+                cbt_mask[i] = True
+
+        return cbt, cbt_mask
     
     def __len__(self) -> int:
         return len(self.data)
@@ -427,6 +515,9 @@ class TableDataset(Dataset):
             if "bboxes" in cached:
                 result["bboxes"] = cached["bboxes"]
                 result["bbox_mask"] = cached["bbox_mask"]
+            if "cell_bbox_per_token" in cached:
+                result["cell_bbox_per_token"] = cached["cell_bbox_per_token"]
+                result["cell_bbox_token_mask"] = cached["cell_bbox_token_mask"]
             return result
 
         # Fallback: process on the fly

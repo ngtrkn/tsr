@@ -57,6 +57,10 @@ class ExperimentConfig:
     lr_decay_factor: float = 0.1  # For step scheduler
     lr_decay_epochs: List[int] = field(default_factory=lambda: [30, 60, 90])  # For step scheduler
     
+    # Phase 3: Coordinate-free + spatial conditioning
+    coordinate_free: bool = False
+    use_spatial_conditioning: bool = False
+
     # Loss weights
     lambda_struc: float = 1.0
     lambda_cont: float = 1.0
@@ -80,6 +84,7 @@ def create_model(config: ExperimentConfig, vocab_size: int) -> TableRecognitionM
         token_compression=config.token_compression,
         use_hybrid_regression=config.use_hybrid_regression,
         use_parallel_decoder=config.use_parallel_decoder,
+        use_spatial_conditioning=config.use_spatial_conditioning,
     )
 
 
@@ -95,6 +100,18 @@ def create_loss_function(config: ExperimentConfig):
         )
     else:
         return nn.CrossEntropyLoss()
+
+
+def _spatial_kwargs(batch, device, config):
+    """Extract spatial conditioning kwargs from batch if coordinate_free is enabled."""
+    if not config.use_spatial_conditioning:
+        return {}
+    if "cell_bbox_per_token" not in batch:
+        return {}
+    return {
+        "cell_bbox_per_token": batch["cell_bbox_per_token"].to(device),
+        "cell_bbox_token_mask": batch["cell_bbox_token_mask"].to(device),
+    }
 
 
 def train_epoch(model, train_loader, optimizer, criterion, device, config, scaler=None,
@@ -122,10 +139,11 @@ def train_epoch(model, train_loader, optimizer, criterion, device, config, scale
         input_ids = batch["input_ids"].to(device)
         try:
             # Mixed precision forward pass
+            spatial_kw = _spatial_kwargs(batch, device, config)
             if config.use_mixed_precision and scaler is not None:
                 with torch.cuda.amp.autocast():
                     if isinstance(criterion, MultiTaskLoss):
-                        outputs = model(images, input_ids=input_ids, return_regression=config.use_hybrid_regression)
+                        outputs = model(images, input_ids=input_ids, return_regression=config.use_hybrid_regression, **spatial_kw)
                         targets = {
                             "token_ids": batch["token_ids"].to(device),
                             "structure_mask": batch["structure_mask"].to(device),
@@ -138,7 +156,7 @@ def train_epoch(model, train_loader, optimizer, criterion, device, config, scale
                         loss_dict = criterion(outputs, targets)
                         loss = loss_dict["total_loss"]
                     else:
-                        outputs = model(images, input_ids=input_ids)
+                        outputs = model(images, input_ids=input_ids, **spatial_kw)
                         loss = criterion(
                             outputs["logits"].view(-1, outputs["logits"].size(-1)),
                             batch["token_ids"].view(-1).to(device)
@@ -149,7 +167,7 @@ def train_epoch(model, train_loader, optimizer, criterion, device, config, scale
             else:
                 # Standard precision
                 if isinstance(criterion, MultiTaskLoss):
-                    outputs = model(images, input_ids=input_ids, return_regression=config.use_hybrid_regression)
+                    outputs = model(images, input_ids=input_ids, return_regression=config.use_hybrid_regression, **spatial_kw)
                     targets = {
                         "token_ids": batch["token_ids"].to(device),
                         "structure_mask": batch["structure_mask"].to(device),
@@ -162,7 +180,7 @@ def train_epoch(model, train_loader, optimizer, criterion, device, config, scale
                     loss_dict = criterion(outputs, targets)
                     loss = loss_dict["total_loss"] / accumulation_steps
                 else:
-                    outputs = model(images, input_ids=input_ids)
+                    outputs = model(images, input_ids=input_ids, **spatial_kw)
                     loss = criterion(
                         outputs["logits"].view(-1, outputs["logits"].size(-1)),
                         batch["token_ids"].view(-1).to(device)
@@ -247,11 +265,12 @@ def validate(model, val_loader, criterion, device, config, scaler=None, vocab: O
         images = batch["image"].to(device)
         input_ids = batch["input_ids"].to(device)
         target_ids = batch["token_ids"].to(device)
+        spatial_kw = _spatial_kwargs(batch, device, config)
         
         if config.use_mixed_precision and scaler is not None:
             with torch.cuda.amp.autocast():
                 if isinstance(criterion, MultiTaskLoss):
-                    outputs = model(images, input_ids=input_ids, return_regression=config.use_hybrid_regression)
+                    outputs = model(images, input_ids=input_ids, return_regression=config.use_hybrid_regression, **spatial_kw)
                     targets = {
                         "token_ids": target_ids,
                         "structure_mask": batch["structure_mask"].to(device),
@@ -264,14 +283,14 @@ def validate(model, val_loader, criterion, device, config, scaler=None, vocab: O
                     loss_dict = criterion(outputs, targets)
                     loss = loss_dict["total_loss"]
                 else:
-                    outputs = model(images, input_ids=input_ids)
+                    outputs = model(images, input_ids=input_ids, **spatial_kw)
                     loss = criterion(
                         outputs["logits"].view(-1, outputs["logits"].size(-1)),
                         target_ids.view(-1)
                     )
         else:
             if isinstance(criterion, MultiTaskLoss):
-                outputs = model(images, input_ids=input_ids, return_regression=config.use_hybrid_regression)
+                outputs = model(images, input_ids=input_ids, return_regression=config.use_hybrid_regression, **spatial_kw)
                 targets = {
                     "token_ids": target_ids,
                     "structure_mask": batch["structure_mask"].to(device),
@@ -284,7 +303,7 @@ def validate(model, val_loader, criterion, device, config, scaler=None, vocab: O
                 loss_dict = criterion(outputs, targets)
                 loss = loss_dict["total_loss"]
             else:
-                outputs = model(images, input_ids=input_ids)
+                outputs = model(images, input_ids=input_ids, **spatial_kw)
                 loss = criterion(
                     outputs["logits"].view(-1, outputs["logits"].size(-1)),
                     target_ids.view(-1)

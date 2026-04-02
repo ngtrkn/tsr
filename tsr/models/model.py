@@ -58,6 +58,30 @@ class ColumnConsistencyHead(nn.Module):
         return self.head(x)
 
 
+class SpatialConditioningMLP(nn.Module):
+    """Projects normalized cell bbox (x, y, w, h) to an embedding that
+    conditions content token generation on the cell's spatial location."""
+
+    def __init__(self, embed_dim: int, hidden_dim: int = 128):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(4, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, embed_dim),
+        )
+
+    def forward(self, bbox: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            bbox: (B, T, 4) normalized cell bbox per token
+            mask: (B, T)    which positions have a valid bbox
+        Returns:
+            (B, T, embed_dim) spatial embedding (zeros where mask is False)
+        """
+        embed = self.mlp(bbox)  # (B, T, embed_dim)
+        return embed * mask.unsqueeze(-1).float()
+
+
 class TableRecognitionModel(nn.Module):
     """
     End-to-End Multi-Task Learning Model for Table Recognition
@@ -76,12 +100,14 @@ class TableRecognitionModel(nn.Module):
         token_compression: Optional[float] = None,
         use_hybrid_regression: bool = True,
         use_parallel_decoder: bool = False,
+        use_spatial_conditioning: bool = False,
     ):
         super().__init__()
         self.vocab_size = vocab_size
         self.embed_dim = embed_dim
         self.use_hybrid_regression = use_hybrid_regression
         self.use_parallel_decoder = use_parallel_decoder
+        self.use_spatial_conditioning = use_spatial_conditioning
         
         # Visual Encoder
         self.encoder = VisualEncoder(
@@ -116,18 +142,25 @@ class TableRecognitionModel(nn.Module):
         if use_hybrid_regression:
             self.regression_head = HybridRegressionHead(embed_dim)
             self.column_consistency_head = ColumnConsistencyHead(embed_dim)
+
+        if use_spatial_conditioning:
+            self.spatial_conditioning = SpatialConditioningMLP(embed_dim)
     
     def forward(
         self,
         images: torch.Tensor,
         input_ids: Optional[torch.Tensor] = None,
         return_regression: bool = False,
+        cell_bbox_per_token: Optional[torch.Tensor] = None,
+        cell_bbox_token_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Args:
             images: (B, C, H, W) input images
             input_ids: (B, T) right-shifted target tokens (for training)
             return_regression: Whether to return regression predictions
+            cell_bbox_per_token: (B, T, 4) GT cell bbox for spatial conditioning (training only)
+            cell_bbox_token_mask: (B, T) mask for valid cell bbox positions
         Returns:
             Dictionary with:
                 - logits: (B, T, vocab_size) or (B, num_queries, max_tokens, vocab_size)
@@ -137,27 +170,31 @@ class TableRecognitionModel(nn.Module):
         # Encode images
         encoder_output = self.encoder(images)  # (B, N, embed_dim)
         
+        # Compute spatial conditioning embedding from GT cell bboxes
+        spatial_embed = None
+        if (self.use_spatial_conditioning and
+                cell_bbox_per_token is not None and cell_bbox_token_mask is not None):
+            spatial_embed = self.spatial_conditioning(cell_bbox_per_token, cell_bbox_token_mask)
+
         if self.use_parallel_decoder:
-            # Parallel decoding
             logits = self.decoder(encoder_output)
             outputs = {"logits": logits}
         else:
-            # Sequential decoding
             if input_ids is None:
                 raise ValueError("input_ids required for sequential decoder")
             
-            # Get logits and features
             if return_regression and self.use_hybrid_regression:
                 logits, decoder_features = self.decoder(
-                    input_ids, encoder_output, return_features=True
+                    input_ids, encoder_output, return_features=True,
+                    spatial_embed=spatial_embed,
                 )
             else:
-                logits = self.decoder(input_ids, encoder_output)
+                logits = self.decoder(input_ids, encoder_output,
+                                      spatial_embed=spatial_embed)
                 decoder_features = None
             
             outputs = {"logits": logits}
             
-            # Hybrid regression
             if return_regression and self.use_hybrid_regression and decoder_features is not None:
                 regression = self.regression_head(decoder_features)
                 column_logits = self.column_consistency_head(decoder_features)

@@ -374,8 +374,19 @@ class Pub1MParser:
                     )
                     processed_positions.add((row_idx, col_idx))
                 
-                # Combine words into content
-                cell_content = ' '.join([w.text for w in cell_words]).strip()
+                # Group words into textlines by line_num, fall back to flat join
+                if any(w.line_num is not None for w in cell_words):
+                    lines_map: dict = {}
+                    for w in cell_words:
+                        ln = w.line_num if w.line_num is not None else 0
+                        lines_map.setdefault(ln, []).append(w)
+                    sorted_lines = sorted(lines_map.items(), key=lambda kv: kv[0])
+                    cell_content = '\n'.join(
+                        ' '.join(w.text for w in words).strip()
+                        for _, words in sorted_lines
+                    ).strip()
+                else:
+                    cell_content = ' '.join(w.text for w in cell_words).strip()
             else:
                 # Empty cell - no words assigned
                 cell_bbox = basic_cell_bbox

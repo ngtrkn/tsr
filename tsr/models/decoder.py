@@ -177,6 +177,7 @@ class TransformerDecoder(nn.Module):
         encoder_output: torch.Tensor,
         causal_mask: Optional[torch.Tensor] = None,
         return_features: bool = False,
+        spatial_embed: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -184,6 +185,7 @@ class TransformerDecoder(nn.Module):
             encoder_output: (B, N, embed_dim) encoder features
             causal_mask: Optional (T, T) causal mask
             return_features: If True, return both logits and features
+            spatial_embed: Optional (B, T, embed_dim) per-token spatial conditioning
         Returns:
             (B, T, vocab_size) logits, or (logits, features) if return_features=True
         """
@@ -191,6 +193,10 @@ class TransformerDecoder(nn.Module):
         
         # Embed tokens (no positional encoding)
         x = self.token_embedding(input_ids)  # (B, T, embed_dim)
+
+        if spatial_embed is not None:
+            x = x + spatial_embed
+
         x = self.embed_dropout(x)
         
         # Create causal mask if not provided
