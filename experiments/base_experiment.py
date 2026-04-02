@@ -972,24 +972,39 @@ def load_checkpoint(
     
     checkpoint = torch.load(checkpoint_path, map_location=device)
     
-    # If the current model has a larger vocab (e.g. extended with OCR chars),
-    # resize first so state_dict shapes match for the original weights.
-    ckpt_vocab_size = checkpoint.get("model_state_dict", {}).get(
+    # Detect vocab size growth (e.g. after extending vocab with OCR chars).
+    # strict=False only handles missing/extra keys, NOT shape mismatches,
+    # so we must manually copy compatible weights for resized layers.
+    ckpt_embed = checkpoint.get("model_state_dict", {}).get(
         "decoder.token_embedding.weight", None)
-    if ckpt_vocab_size is not None:
-        ckpt_vs = ckpt_vocab_size.shape[0]
-        if model.vocab_size > ckpt_vs:
-            print(f"  Vocab grew {ckpt_vs} → {model.vocab_size}, loading partial weights")
-            model.load_state_dict(checkpoint["model_state_dict"], strict=False)
-        else:
-            model.load_state_dict(checkpoint["model_state_dict"])
+    vocab_grew = (ckpt_embed is not None and model.vocab_size > ckpt_embed.shape[0])
+
+    if vocab_grew:
+        ckpt_vs = ckpt_embed.shape[0]
+        print(f"  Vocab grew {ckpt_vs} → {model.vocab_size}, loading partial weights")
+        model_state = model.state_dict()
+        for key, ckpt_param in checkpoint["model_state_dict"].items():
+            if key not in model_state:
+                continue
+            if model_state[key].shape == ckpt_param.shape:
+                model_state[key] = ckpt_param
+            else:
+                # Partial copy: old weights into the leading slice of new tensor
+                slices = tuple(slice(0, s) for s in ckpt_param.shape)
+                model_state[key][slices] = ckpt_param
+                print(f"    partial load: {key} {ckpt_param.shape} → {model_state[key].shape}")
+        model.load_state_dict(model_state)
     else:
         model.load_state_dict(checkpoint["model_state_dict"])
     print(f"  ✓ Loaded model state")
-    
-    # Load optimizer state
-    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    print(f"  ✓ Loaded optimizer state")
+
+    # When vocab grew, optimizer momentum/variance buffers have wrong shapes
+    # for the resized layers, so we skip restoring optimizer state.
+    if vocab_grew:
+        print(f"  ⚠ Skipping optimizer state (vocab resized, buffers incompatible)")
+    else:
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        print(f"  ✓ Loaded optimizer state")
     
     # Load scaler state if available
     if scaler is not None and "scaler_state_dict" in checkpoint:
