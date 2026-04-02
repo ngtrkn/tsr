@@ -156,9 +156,30 @@ class TransformerDecoder(nn.Module):
         self.output_norm = nn.LayerNorm(embed_dim)
         self.output_proj = nn.Linear(embed_dim, vocab_size)
     
+    def resize_embeddings(self, new_vocab_size: int):
+        """Grow token embedding and output projection to accommodate new tokens."""
+        old_size = self.vocab_size
+        if new_vocab_size <= old_size:
+            return
+
+        old_embed = self.token_embedding
+        new_embed = nn.Embedding(new_vocab_size, self.embed_dim, padding_idx=0)
+        new_embed.weight.data[:old_size] = old_embed.weight.data
+        nn.init.normal_(new_embed.weight.data[old_size:], mean=0.0, std=0.02)
+        self.token_embedding = new_embed
+
+        old_proj = self.output_proj
+        new_proj = nn.Linear(old_proj.in_features, new_vocab_size)
+        new_proj.weight.data[:old_size] = old_proj.weight.data
+        new_proj.bias.data[:old_size] = old_proj.bias.data
+        nn.init.normal_(new_proj.weight.data[old_size:], mean=0.0, std=0.02)
+        nn.init.zeros_(new_proj.bias.data[old_size:])
+        self.output_proj = new_proj
+
+        self.vocab_size = new_vocab_size
+
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory efficiency"""
-        # This is a placeholder - actual checkpointing happens in forward pass
         self._gradient_checkpointing = True
     
     def gradient_checkpointing_disable(self):

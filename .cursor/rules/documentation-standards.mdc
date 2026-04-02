@@ -1,0 +1,39 @@
+---
+description: Documentation standards — keep docs minimal and consolidated
+globs: "**/*.md"
+alwaysApply: false
+---
+
+# Documentation Standards
+
+## Structure
+
+This project uses exactly two documentation files:
+
+| File | Purpose |
+|------|---------|
+| `README.md` | Quick-start: installation, basic usage, project overview |
+| `docs/technical_report.md` | In-depth: problem statement, architecture, experiment design, results |
+
+## Rules
+
+1. **Never create new top-level markdown files.** All documentation belongs in one of the two files above.
+2. **README.md** should stay concise — installation, data prep, training commands, inference examples, and a brief project structure. No architecture details or experiment rationales.
+3. **docs/technical_report.md** is the single source for technical depth — related work, model architecture, data pipeline internals, experiment configs, results tables, and proposed experiments.
+4. When adding a new feature or experiment, update the relevant section in `docs/technical_report.md` rather than creating a separate guide.
+5. Keep code examples in docs minimal and runnable. Prefer showing the actual CLI command over pseudo-code.
+6. Do not duplicate content between the two files. README may link to the technical report for details.
+
+## Adding New Experiments
+
+When a new experiment is introduced, add a subsection under the appropriate phase in `docs/technical_report.md`:
+
+```
+## 7. Experiment Profiles
+### 7.X Experiment_Name
+- **Hypothesis**: ...
+- **Config changes**: ...
+- **Run command**: ...
+```
+
+Do **not** create a standalone `EXPERIMENT_NAME.md` file.

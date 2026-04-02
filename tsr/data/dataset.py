@@ -21,102 +21,72 @@ import os
 import time
 
 
+def _pad_or_zero(tensor: Optional[torch.Tensor], pad_len: int,
+                  shape_suffix: tuple, dtype: torch.dtype, max_len: int):
+    """Pad an existing tensor or create a zero tensor of length max_len."""
+    if tensor is not None:
+        if pad_len > 0:
+            return torch.cat([tensor, torch.zeros((pad_len, *shape_suffix), dtype=dtype)])
+        return tensor
+    return torch.zeros((max_len, *shape_suffix), dtype=dtype)
+
+
 def collate_fn(batch: List[Dict]) -> Dict:
-    """
-    Custom collate function to pad sequences to same length
-    """
-    # Find max sequence length
+    """Custom collate function that handles mixed batches (TSR + OCR)."""
     max_len = max(
         max(item["input_ids"].shape[0], item["token_ids"].shape[0])
         for item in batch
     )
-    
-    # Pad all sequences
+
+    pad_token_id = 0
+    has_bboxes = any("bboxes" in item for item in batch)
+    has_cbt = any("cell_bbox_per_token" in item for item in batch)
+
     padded_input_ids = []
     padded_token_ids = []
     padded_struct_mask = []
     padded_cont_mask = []
     padded_bboxes = []
     padded_bbox_mask = []
+    padded_cbt = []
+    padded_cbt_mask = []
     images = []
-    
-    # Get padding token ID (should be 0 based on serialization.py)
-    pad_token_id = 0  # PAD_TOKEN is always mapped to 0
-    
+
     for item in batch:
         seq_len = item["input_ids"].shape[0]
-        
-        # Pad input_ids
         pad_len = max_len - seq_len
-        if pad_len > 0:
-            padded_input = torch.cat([
-                item["input_ids"],
-                torch.full((pad_len,), pad_token_id, dtype=torch.long)
-            ])
-        else:
-            padded_input = item["input_ids"]
-        padded_input_ids.append(padded_input)
-        
-        # Pad token_ids
-        if pad_len > 0:
-            padded_token = torch.cat([
-                item["token_ids"],
-                torch.full((pad_len,), pad_token_id, dtype=torch.long)
-            ])
-        else:
-            padded_token = item["token_ids"]
-        padded_token_ids.append(padded_token)
-        
-        # Pad masks
-        if pad_len > 0:
-            padded_struct = torch.cat([
-                item["structure_mask"],
-                torch.zeros(pad_len, dtype=torch.bool)
-            ])
-            padded_cont = torch.cat([
-                item["content_mask"],
-                torch.zeros(pad_len, dtype=torch.bool)
-            ])
-        else:
-            padded_struct = item["structure_mask"]
-            padded_cont = item["content_mask"]
-        padded_struct_mask.append(padded_struct)
-        padded_cont_mask.append(padded_cont)
-        
-        # Pad bboxes if present
-        if "bboxes" in item:
-            bbox_len = item["bboxes"].shape[0]
-            bbox_pad_len = max_len - bbox_len
-            if bbox_pad_len > 0:
-                padded_bbox = torch.cat([
-                    item["bboxes"],
-                    torch.zeros((bbox_pad_len, 4), dtype=torch.float32)
-                ])
-                padded_bbox_m = torch.cat([
-                    item["bbox_mask"],
-                    torch.zeros(bbox_pad_len, dtype=torch.bool)
-                ])
-            else:
-                padded_bbox = item["bboxes"]
-                padded_bbox_m = item["bbox_mask"]
-            padded_bboxes.append(padded_bbox)
-            padded_bbox_mask.append(padded_bbox_m)
-        
-        # Pad cell_bbox_per_token if present (for spatial conditioning)
-        if "cell_bbox_per_token" in item:
-            cbt = item["cell_bbox_per_token"]  # (T, 4)
-            cbt_mask = item["cell_bbox_token_mask"]  # (T,)
-            if pad_len > 0:
-                cbt = torch.cat([cbt, torch.zeros((pad_len, 4), dtype=torch.float32)])
-                cbt_mask = torch.cat([cbt_mask, torch.zeros(pad_len, dtype=torch.bool)])
-            if "padded_cell_bbox_per_token" not in result:
-                result["_cell_bbox_per_token"] = []
-                result["_cell_bbox_token_mask"] = []
-            result.setdefault("_cell_bbox_per_token", []).append(cbt)
-            result.setdefault("_cell_bbox_token_mask", []).append(cbt_mask)
+
+        padded_input_ids.append(
+            torch.cat([item["input_ids"], torch.full((pad_len,), pad_token_id, dtype=torch.long)])
+            if pad_len > 0 else item["input_ids"]
+        )
+        padded_token_ids.append(
+            torch.cat([item["token_ids"], torch.full((pad_len,), pad_token_id, dtype=torch.long)])
+            if pad_len > 0 else item["token_ids"]
+        )
+        padded_struct_mask.append(
+            torch.cat([item["structure_mask"], torch.zeros(pad_len, dtype=torch.bool)])
+            if pad_len > 0 else item["structure_mask"]
+        )
+        padded_cont_mask.append(
+            torch.cat([item["content_mask"], torch.zeros(pad_len, dtype=torch.bool)])
+            if pad_len > 0 else item["content_mask"]
+        )
+
+        if has_bboxes:
+            padded_bboxes.append(
+                _pad_or_zero(item.get("bboxes"), pad_len, (4,), torch.float32, max_len))
+            padded_bbox_mask.append(
+                _pad_or_zero(item.get("bbox_mask"), pad_len, (), torch.bool, max_len))
+
+        if has_cbt:
+            padded_cbt.append(
+                _pad_or_zero(item.get("cell_bbox_per_token"), pad_len, (4,), torch.float32, max_len))
+            padded_cbt_mask.append(
+                _pad_or_zero(item.get("cell_bbox_token_mask"), pad_len, (), torch.bool, max_len))
 
         images.append(item["image"])
-    
+
     result = {
         "image": torch.stack(images),
         "input_ids": torch.stack(padded_input_ids),
@@ -124,14 +94,14 @@ def collate_fn(batch: List[Dict]) -> Dict:
         "structure_mask": torch.stack(padded_struct_mask),
         "content_mask": torch.stack(padded_cont_mask),
     }
-    
+
     if padded_bboxes:
         result["bboxes"] = torch.stack(padded_bboxes)
         result["bbox_mask"] = torch.stack(padded_bbox_mask)
-    
-    if "_cell_bbox_per_token" in result:
-        result["cell_bbox_per_token"] = torch.stack(result.pop("_cell_bbox_per_token"))
-        result["cell_bbox_token_mask"] = torch.stack(result.pop("_cell_bbox_token_mask"))
+
+    if padded_cbt:
+        result["cell_bbox_per_token"] = torch.stack(padded_cbt)
+        result["cell_bbox_token_mask"] = torch.stack(padded_cbt_mask)
 
     return result
 
@@ -498,6 +468,11 @@ class TableDataset(Dataset):
 
         return cbt, cbt_mask
     
+    def update_vocab(self, vocab: Dict[str, int]):
+        """Replace vocab with an extended version (e.g. after OCR dataset adds tokens)."""
+        self.vocab = vocab
+        self.id_to_token = {v: k for k, v in vocab.items()}
+
     def __len__(self) -> int:
         return len(self.data)
     

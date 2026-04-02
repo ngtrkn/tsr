@@ -461,7 +461,13 @@ def run_validation_only(
         vocab = checkpoint["vocab"]
         print(f"  Loaded vocab from checkpoint ({len(vocab)} tokens)")
 
-    vocab_size = len(vocab) if vocab else len(val_loader.dataset.vocab)
+    if vocab is not None:
+        vocab_size = len(vocab)
+    elif hasattr(val_loader.dataset, "vocab"):
+        vocab_size = len(val_loader.dataset.vocab)
+        vocab = val_loader.dataset.vocab
+    else:
+        raise ValueError("vocab must be provided when using ConcatDataset or similar")
 
     model = create_model(config, vocab_size)
     model.load_state_dict(checkpoint["model_state_dict"])
@@ -528,8 +534,14 @@ def run_experiment(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Get vocab size from dataset
-    vocab_size = len(train_loader.dataset.vocab)
+    # Get vocab size — prefer explicit vocab, fall back to dataset attribute
+    if vocab is not None:
+        vocab_size = len(vocab)
+    elif hasattr(train_loader.dataset, "vocab"):
+        vocab_size = len(train_loader.dataset.vocab)
+        vocab = train_loader.dataset.vocab
+    else:
+        raise ValueError("vocab must be provided when using ConcatDataset or similar")
     
     # Create model
     model = create_model(config, vocab_size)
@@ -960,8 +972,19 @@ def load_checkpoint(
     
     checkpoint = torch.load(checkpoint_path, map_location=device)
     
-    # Load model state
-    model.load_state_dict(checkpoint["model_state_dict"])
+    # If the current model has a larger vocab (e.g. extended with OCR chars),
+    # resize first so state_dict shapes match for the original weights.
+    ckpt_vocab_size = checkpoint.get("model_state_dict", {}).get(
+        "decoder.token_embedding.weight", None)
+    if ckpt_vocab_size is not None:
+        ckpt_vs = ckpt_vocab_size.shape[0]
+        if model.vocab_size > ckpt_vs:
+            print(f"  Vocab grew {ckpt_vs} → {model.vocab_size}, loading partial weights")
+            model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+        else:
+            model.load_state_dict(checkpoint["model_state_dict"])
+    else:
+        model.load_state_dict(checkpoint["model_state_dict"])
     print(f"  ✓ Loaded model state")
     
     # Load optimizer state

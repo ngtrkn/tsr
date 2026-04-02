@@ -145,7 +145,15 @@ class TableRecognitionModel(nn.Module):
 
         if use_spatial_conditioning:
             self.spatial_conditioning = SpatialConditioningMLP(embed_dim)
-    
+
+    def resize_embeddings(self, new_vocab_size: int):
+        """Resize decoder embeddings and output projection for a larger vocab."""
+        if new_vocab_size <= self.vocab_size:
+            return
+        if not self.use_parallel_decoder:
+            self.decoder.resize_embeddings(new_vocab_size)
+        self.vocab_size = new_vocab_size
+
     def forward(
         self,
         images: torch.Tensor,

@@ -72,6 +72,28 @@ def load_vocab_auto(path: str) -> Dict[str, int]:
         return load_vocab_txt(str(path))
 
 
+def extend_vocab(vocab: Dict[str, int], new_tokens: set) -> int:
+    """Add tokens that are not yet in vocab. Returns number of tokens added."""
+    added = 0
+    for token in sorted(new_tokens):
+        if token not in vocab:
+            vocab[token] = len(vocab)
+            added += 1
+    return added
+
+
+def extend_vocab_from_texts(vocab: Dict[str, int], texts: list) -> int:
+    """Scan character-level tokens from a list of strings and extend vocab.
+
+    Useful for adding Japanese / Unicode characters discovered in OCR data.
+    Returns number of new tokens added.
+    """
+    chars = set()
+    for text in texts:
+        chars.update(text)
+    return extend_vocab(vocab, chars)
+
+
 def get_id_to_token(vocab: Dict[str, int]) -> Dict[int, str]:
     """Convert token->id mapping to id->token mapping"""
     return {v: k for k, v in vocab.items()}

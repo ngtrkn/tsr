@@ -67,7 +67,27 @@ python experiments/exp_improvement_hybrid_regression.py \
     --batch_size 4 --num_epochs 10
 ```
 
-Available experiments: `exp_foundation_basic`, `exp_improvement_hybrid_regression`, `exp_improvement_html_refiner`, `exp_improvement_gc_attention`, `exp_improvement_token_compression`, `exp_improvement_all_combined`.
+Available experiments: `exp_foundation_basic`, `exp_improvement_hybrid_regression`, `exp_improvement_html_refiner`, `exp_improvement_gc_attention`, `exp_improvement_token_compression`, `exp_improvement_all_combined`, `exp_improvement_spatial_ocr`.
+
+**OCR-only or mixed TSR + OCR training:**
+
+```bash
+# OCR dataset: pipe-delimited text file (image_path|text per line)
+python train_mixed.py --ocr_data data/ocr_train.txt --batch_size 8
+
+# Mixed TSR + OCR (vocab auto-extends for new characters)
+python train_mixed.py \
+    --tsr_data ./dummy_dataset/train/dataset_list.json \
+    --ocr_data data/ocr_en.txt data/ocr_jp.txt \
+    --val_path ./dummy_dataset/val/dataset_list.json
+```
+
+OCR data format — one sample per line:
+
+```
+path/to/image.png|Ground Truth Text
+path/to/img2.png|日本語テキスト
+```
 
 ### 3. Resume / Validate
 
@@ -117,6 +137,7 @@ tsr/
 │   ├── data/
 │   │   ├── serialization.py    # Sequence serialization & coordinate discretization
 │   │   ├── dataset.py          # TableDataset (simplified & legacy formats)
+│   │   ├── ocr_dataset.py     # OCRDataset (pipe-delimited text)
 │   │   └── pub1m_parser.py     # PubTables-1M XML/words parser
 │   ├── models/
 │   │   ├── encoder.py          # Swin-B / ResNet-31 / ConvStem + GCAttention
@@ -132,6 +153,7 @@ tsr/
 │       └── vocab.py            # Vocabulary save/load (txt & json)
 ├── experiments/                # Per-experiment scripts & framework
 ├── train.py                    # Config-driven training entry point
+├── train_mixed.py              # Mixed TSR + OCR training
 ├── export_vocab.py             # Export vocab from checkpoint
 ├── create_dummy_dataset.py     # Dataset creation from PubTables-1M
 ├── example_inference.py        # Inference example
