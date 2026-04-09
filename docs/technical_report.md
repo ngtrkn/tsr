@@ -204,6 +204,188 @@ This generates `comparison_report.md` with:
 - Percentage improvement over the foundation baseline
 - Model size trade-off analysis
 
+### 5.5 Model architecture flows (training vs inference)
+
+This subsection documents how data moves through `TableRecognitionModel` for **each experiment script** under `experiments/`. Unless noted, the **decoder** is the sequential `TransformerDecoder` (not the parallel/DREAM path).
+
+**Shared notation**
+
+| Symbol | Meaning |
+|--------|---------|
+| `Enc` | Visual encoder (backbone varies by experiment) |
+| `Dec` | Transformer decoder (NoPE, optional HTML refiner inside) |
+| `shift(y)` | Right-shifted teacher input built from ground-truth sequence `y` |
+| `CE` | Token cross-entropy (structure + content + coordinate tokens when present) |
+| `Reg` | `HybridRegressionHead` on decoder hidden states → normalized `(x,y,w,h)` |
+| `Col` | `ColumnConsistencyHead` (used only when hybrid regression is on) |
+| `Spatial` | `SpatialConditioningMLP`: per-token bbox `(x,y,w,h)` → embedding added to token embeddings before decoder layers |
+
+**Validation (metrics)** in `base_experiment.validate` uses **teacher forcing**: the same **training** forward is run with `shift(y)` and ground-truth length. **Autoregressive inference** uses `model.generate()` (one step at a time, no future tokens).
+
+---
+
+#### Foundation_Basic (`exp_foundation_basic.py`)
+
+Encoder: `resnet31`. No hybrid regression, no spatial conditioning. Optional `token_compression=0.8` on the encoder in config.
+
+**Training (teacher forcing)**
+
+```mermaid
+flowchart LR
+  I[Image] --> Enc
+  Enc --> V[Vision tokens]
+  shift[shift of GT sequence y] --> Dec
+  V --> Dec
+  Dec --> L[Logits]
+  L --> CE[CE loss]
+```
+
+**Inference (autoregressive)**
+
+```mermaid
+flowchart LR
+  I[Image] --> Enc
+  Enc --> V[Vision tokens]
+  prefix[Prefix starts with BOS] --> Dec
+  V --> Dec
+  Dec --> L[Logits at last step]
+  L --> S[Sample or argmax next token]
+  S -->|append| prefix
+```
+
+---
+
+#### Improvement_HybridRegression (`exp_improvement_hybrid_regression.py`)
+
+Adds `Reg` and `Col` on **the same** decoder hidden states used for logits (single decoder forward). Supervision: L1 + IoU + column consistency against per-token bbox targets from the dataset.
+
+**Training**
+
+```mermaid
+flowchart LR
+  I[Image] --> Enc
+  shift[shift y] --> Dec
+  Enc --> Dec
+  Dec --> L[Logits]
+  Dec --> H[Hidden states]
+  H --> Reg[Reg head]
+  H --> Col[Col head]
+  L --> CE[CE loss]
+  Reg --> Rloss[L1 + IoU]
+  Col --> Closs[Consistency loss]
+```
+
+**Inference**
+
+Same autoregressive loop as Foundation_Basic; regression heads are optional at decode time (e.g. for tracing boxes), not required to produce the next token.
+
+---
+
+#### Improvement_HTMLRefiner (`exp_improvement_html_refiner.py`)
+
+Same as HybridRegression, plus **HTML refiner** (non-causal self-attention block after decoder layers, before the output projection). Flow topology is unchanged; `Dec` denotes “decoder stack including refiner.”
+
+**Training / inference**
+
+Diagram identical to Improvement_HybridRegression, with the note that `Dec` includes the refiner submodule.
+
+---
+
+#### Improvement_GCAttention (`exp_improvement_gc_attention.py`)
+
+Same as HTMLRefiner experiment config, with **GCAttention** enabled inside `Enc`. Only the encoder path changes.
+
+**Training**
+
+```mermaid
+flowchart LR
+  I[Image] --> Enc["Enc + GCAttention"]
+  shift[shift y] --> Dec
+  Enc --> Dec
+  Dec --> L[Logits]
+  Dec --> H[Hidden states]
+  H --> Reg
+  H --> Col
+  L --> CE
+  Reg --> Rloss
+  Col --> Closs
+```
+
+**Inference**
+
+Same as HybridRegression autoregressive loop; encoder still uses GCAttention.
+
+---
+
+#### Improvement_TokenCompression (`exp_improvement_token_compression.py`)
+
+Same as GCAttention experiment, plus **token compression** in the encoder (shorter vision token sequence, ratio e.g. `0.8`).
+
+**Training / inference**
+
+Same graph as Improvement_GCAttention; vision tokens `V` are fewer tokens per image.
+
+---
+
+#### Improvement_SpatialOCR & Improvement_AllCombined (`exp_improvement_spatial_ocr.py`, `exp_improvement_all_combined.py`)
+
+These enable **`coordinate_free`** (no discrete coordinate tokens in the sequence), **`use_hybrid_regression`**, and **`use_spatial_conditioning`**. Cell location is **only** from the regression head; spatial conditioning for content tokens uses **predicted** bboxes, not ground-truth bboxes, so training matches inference.
+
+**Training (two decoder passes per batch)**
+
+1. **Unconditioned pass:** `Dec` with `spatial_embed = 0`, `return_features=True` → hidden states `H₀`.
+2. `Reg(H₀)` → per-step bbox predictions; at each `<td>`/`<th>` position the predicted vector is **broadcast** to following in-cell token positions (same layout as dataset `cell_bbox_per_token`, but values from `Reg`).
+3. `Spatial` maps those per-token boxes to embeddings.
+4. **Conditioned pass:** `Dec` with `spatial_embed` added to token embeddings → **logits** for CE.
+
+Regression and column losses still use **`Reg(H₀)`** (and features aligned with `H₀`), i.e. the same head output used to build spatial layout.
+
+```mermaid
+flowchart TB
+  I[Image] --> Enc
+  shift[shift y] --> Dec0["Dec spatial=0"]
+  Enc --> Dec0
+  Dec0 --> H0[Hidden H0]
+  H0 --> Reg[Reg head]
+  Reg --> Layout["Broadcast bbox at cell opens to in-cell positions"]
+  Layout --> Sp[Spatial MLP]
+  Sp --> E[spatial_embed tensor]
+  shift --> Dec1["Dec + spatial_embed"]
+  Enc --> Dec1
+  E --> Dec1
+  Dec1 --> L[Logits]
+  L --> CE[CE loss]
+  Reg --> Rloss[L1 + IoU]
+  H0 --> Col[Col head]
+  Col --> Closs[Consistency loss]
+```
+
+**Inference (autoregressive, each new token)**
+
+For each prefix `g` (generated so far), the implementation runs the **same** two-pass pattern: `Dec(g)` without spatial → `Reg` → build `spatial_embed` from `g` + predicted boxes → `Dec(g)` with spatial → logits for the **next** token only.
+
+```mermaid
+flowchart TB
+  I[Image] --> Enc
+  g[Current prefix g] --> D0["Dec g spatial=0"]
+  Enc --> D0
+  D0 --> Reg[Reg head on full prefix]
+  Reg --> Layout["Cell-open anchors broadcast to content steps"]
+  Layout --> Sp[Spatial MLP]
+  Sp --> D1["Dec g with spatial"]
+  Enc --> D1
+  D1 --> L["Logits at last position"]
+  L --> Next[Sample next token]
+```
+
+`Improvement_AllCombined` is the same spatial two-pass logic, with **HTML refiner**, **GCAttention**, and **token compression** enabled together per its `ExperimentConfig`.
+
+---
+
+#### Optional: mixed TSR + OCR training
+
+`train_mixed.py` uses the same `TableRecognitionModel` forward as the selected `ExperimentConfig`; when spatial conditioning and hybrid regression are on, **`model.set_id_to_token(...)`** must be registered (handled in `run_experiment` for experiment scripts).
+
 ## 6. Results and Discussion
 
 *This section should be populated after running the full experiment suite. Template below.*
@@ -359,35 +541,19 @@ Additionally, cells often contain multiple lines of text. The current representa
 
 **Design.**
 
-The key change is a **spatial conditioning module** that projects the regression-predicted cell bbox into an embedding and adds it to the decoder hidden state for all content tokens within that cell.
+The key change is a **spatial conditioning module** that projects the regression-predicted cell bbox into an embedding and adds it to the decoder input for in-cell tokens. **Training and inference use the same signal:** bbox layout is built from **`HybridRegressionHead` outputs** on an **unconditioned** decoder pass, then fed through `SpatialConditioningMLP` into a **second** decoder pass for logits (see **§5.5**, Improvement_SpatialOCR / AllCombined diagrams). Regression quality is enforced by L1/IoU (and related) losses on the same predictions.
 
-```
-                     ┌─────────────────────┐
-  <td> token ──────► │  Decoder layers     │──► regression head ──► (x,y,w,h)
-                     │                     │           │
-                     │                     │     ┌─────▼──────┐
-                     │                     │     │ Spatial MLP │──► cell_spatial_embed
-                     │                     │     └─────────────┘         │
-  content tokens ──► │  + cell_spatial_embed ◄──────────────────────────┘
-                     │                     │
-                     │  Decoder layers     │──► content logits
-                     └─────────────────────┘
-```
+1. **Per-step regression**: The regression head produces `(x, y, w, h)` at every sequence position from decoder hidden states (typically supervised at structure-relevant steps via `bbox_mask`).
 
-1. **Cell spatial embedding**: When the decoder processes a `<td>` or `<th>` token, the regression head produces `(x, y, w, h)`. A small MLP projects this 4D vector to `embed_dim`:
-   ```
-   cell_spatial_embed = SpatialMLP([x, y, w, h])  → (embed_dim,)
-   ```
+2. **Broadcast to in-cell tokens**: At each `<td>` / `<th>` open tag, the predicted box at that step is **reused** for all following content tokens until the matching `</td>` / `</th>` (same structural rule as `TableDataset._build_cell_bbox_per_token`).
 
-2. **Injection**: For all subsequent content tokens within that cell (until `</td>` or `</th>`), `cell_spatial_embed` is added to the token embedding before the decoder layers. This conditions every content token on the cell's predicted location.
+3. **Injection**: For those positions, `SpatialMLP([x, y, w, h])` → `embed_dim` is **added to the token embedding** before decoder layers on the **conditioned** pass.
 
-3. **Textline structure**: Cell content is organized as textlines separated by `<LineSep>`:
+4. **Textline structure**: Cell content is organized as textlines separated by `<LineSep>`:
    ```
    <td> L i n e 1 <LineSep> L i n e 2 </td> <Sep>
    ```
    PubTables-1M word data already includes `line_num` per word, so textlines can be reconstructed by grouping words by `line_num`.
-
-4. **Training**: During teacher-forced training, the ground-truth cell bbox can be used for the spatial embedding (or the regression prediction — experimenting with both). During inference, the regression prediction is used since ground-truth is unavailable.
 
 **Current vs. proposed sequence:**
 
@@ -416,7 +582,7 @@ Proposed (with coordinate-free vocab from 9.1):
 | `ExperimentConfig` | Add `use_spatial_conditioning: bool` field |
 | New experiment script | `exp_improvement_spatial_ocr.py` |
 
-**Risk.** During early training the regression head is inaccurate, so the spatial embedding will be noisy. A schedule that gradually increases the weight of the spatial embedding (or uses ground-truth bbox early on) would help. Adding `<LineSep>` tokens slightly increases sequence length.
+**Risk.** During early training the regression head is inaccurate, so the spatial embedding is noisy; the regression losses must carry most of the early spatial learning. Adding `<LineSep>` tokens slightly increases sequence length.
 
 ---
 
